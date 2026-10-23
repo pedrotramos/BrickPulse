@@ -162,7 +162,7 @@ The visual system keeps explanation beside the number: scope, period, confidence
 
 ## Colors
 
-The palette has a petrol interface accent, a separate orange logo, cool neutrals and semantic status treatments. Frontmatter values are extracted from `frontend/src/styles.css`, except `logo-orange`, which comes from the fill in `frontend/logo-options/svg/03-frequencia-symbol-color.svg`; these are the normative values. The logo color does not change the interface accent.
+The palette has a petrol interface accent, a separate orange logo, cool neutrals and semantic status treatments. Frontmatter values are extracted from `frontend/src/styles.css`, except `logo-orange`, which comes from the fill in `docs/brand/brickpulse-symbol-color.svg`; these are the normative values. The logo color does not change the interface accent.
 
 ### Primary
 
@@ -245,7 +245,7 @@ Panels and findings use softly rounded corners from the panel token. Controls an
 
 **The Shape Hierarchy Rule.** Keep work surfaces, controls and status tags on their existing separate corner sizes; this small hierarchy supplies the workbench's form language.
 
-**The Original Logo Rule.** Use the exact original Frequência symbol from `frontend/logo-options/svg/03-frequencia-symbol-color.svg`, preserving all five rounded bars, their positions and Logo Orange. The sidebar and favicon use the same SVG; do not redraw, recolor or combine the approved symbol with another mark.
+**The Original Logo Rule.** Use the exact original Frequência symbol from `docs/brand/brickpulse-symbol-color.svg`, preserving all five rounded bars, their positions and Logo Orange. The sidebar and favicon use the same SVG; do not redraw, recolor or combine the approved symbol with another mark.
 
 ## Components
 

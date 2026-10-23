@@ -1,4 +1,4 @@
-"""Keep the approved original logo distinct from rejected design studies."""
+"""The app shows the exact brand symbol kept in docs/brand."""
 
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_favicon_is_exact_original_frequency_candidate():
-    approved = ROOT / "frontend/logo-options/svg/03-frequencia-symbol-color.svg"
+    approved = ROOT / "docs/brand/brickpulse-symbol-color.svg"
     favicon = ROOT / "frontend/public/favicon.svg"
     assert favicon.read_bytes() == approved.read_bytes()
     tree = ET.fromstring(favicon.read_text())

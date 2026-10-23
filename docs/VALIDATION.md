@@ -30,7 +30,7 @@ O Playwright lista dez cenários (cinco por viewport), mas **não foi executado 
 
 Após avaliar seis propostas e rejeitar uma fusão de 3 e 4, o usuário escolheu a opção 3 original, **Frequência**. O app e o favicon utilizam o mesmo vetor de cinco barras arredondadas em `#B94B2C`, sem alterar a paleta petrol dos controles. A URL versionada evita reutilizar o ícone antigo em cache.
 
-A igualdade com o vetor escolhido é protegida por teste. O build de produção foi refeito. As capturas `approved-frequency-desktop.png` (1440 px) e `approved-frequency-mobile.png` (390 px, menu aberto) mostram a aplicação real em modo demo. A revisão independente aprovou somente a troca do logo, seu posicionamento e a ligação ao favicon, sem ajustes. Não é uma nova revisão completa do app. Os dois avisos de migração futura do React Router continuam presentes; nenhum erro de console foi observado nesta verificação.
+A igualdade com o vetor escolhido, mantido em `docs/brand/`, é protegida por teste. O build de produção foi refeito. A revisão independente aprovou somente a troca do logo, seu posicionamento e a ligação ao favicon, sem ajustes. Não é uma nova revisão completa do app. Os dois avisos de migração futura do React Router continuam presentes; nenhum erro de console foi observado nesta verificação.
 
 ## Empacotamento
 
