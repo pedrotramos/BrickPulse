@@ -1,0 +1,61 @@
+name: Bug report
+description: Something doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Check [troubleshooting](https://github.com/pedrotramos/BrickPulse/blob/main/docs/en/troubleshooting.md) first.
+        **Redact workspace URLs, emails, tokens and ids** in everything you paste.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Deploy with `scripts/deploy.py --target dev ...`
+        2. Open Opportunities
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: BrickPulse version or commit
+      placeholder: 0.1.0 / abc1234
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where does it happen?
+      options:
+        - Local demo (npm run dev)
+        - Deployed app
+        - Pipeline / daily refresh job
+        - scripts/deploy.py
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: cloud
+    attributes:
+      label: Cloud
+      options: [AWS, Azure, GCP, Not applicable]
+  - type: dropdown
+    id: language
+    attributes:
+      label: UI language
+      options: [English, Español, Português, Not applicable]
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and output
+      description: Deploy output, app logs or browser console errors.
+      render: text

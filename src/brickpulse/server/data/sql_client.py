@@ -8,6 +8,7 @@ through parameter binding or server-side-validated numeric scoping.
 
 from __future__ import annotations
 
+import json as _json
 import re
 
 from ..config import Settings
@@ -47,8 +48,6 @@ try:  # pragma: no cover - environment probe
     _HAS_PYARROW = True
 except Exception:  # pragma: no cover
     _HAS_PYARROW = False
-
-import json as _json
 
 _COMPLEX_TYPES = frozenset({"array", "map", "struct"})
 

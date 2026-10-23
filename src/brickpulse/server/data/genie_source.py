@@ -61,7 +61,6 @@ log = get_logger(__name__)
 #: Cache TTL. The pipeline recomputes daily, so minutes of staleness are
 #: irrelevant while re-scanning billing.usage per page view is not free. Overridable
 #: via FINOPS_GENIE_CACHE_TTL (as spend/apps).
-import os as _os
 
 _CACHE_TTL_S = int(get_env("FINOPS_GENIE_CACHE_TTL", "300") or "300")
 _CACHE_MAX_ROWS = 5000  # LRU bound by spaces + workspaces + users cached

@@ -153,7 +153,6 @@ def apps_inventory_sql(
     history. Without the guard the whole query would fail on the missing table and
     the Apps tab would be empty.
     """
-    import os as _os
 
     no_audit = get_env("FINOPS_NO_AUDIT", "").lower() in ("1", "true", "yes", "on")
     priced = _priced_cte(

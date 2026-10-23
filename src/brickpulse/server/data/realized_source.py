@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from brickpulse.environment import get_env
 
-import os as _os
 import random
 from collections import defaultdict
 from collections.abc import Callable

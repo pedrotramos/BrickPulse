@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from ..identity import Scope
 from ..models import Recommendation
 from ..models.group import group_id
 from ..models.serverless import (

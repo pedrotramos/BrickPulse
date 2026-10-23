@@ -36,7 +36,6 @@ log = get_logger(__name__)
 
 #: Cache TTL (seconds). The pipeline recomputes daily, so minutes of staleness are
 #: irrelevant. Overridable via FINOPS_APPS_CACHE_TTL, like spend.
-import os as _os
 
 _CACHE_TTL_S = int(get_env("FINOPS_APPS_CACHE_TTL", "300") or "300")
 _CACHE_MAX_APPS = 5000  # LRU bound by total apps cached

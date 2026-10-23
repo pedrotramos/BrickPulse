@@ -550,7 +550,6 @@ def _evidence(rule_id: str, waste: float, rng: random.Random) -> tuple[float | N
         viz_autostop_tradeoff,
         viz_cluster_contention,
         viz_cluster_daily,
-        viz_cluster_resources,
         viz_cluster_week_heatmap,
         viz_cpu_area,
         viz_driver_worker_split,
@@ -1776,7 +1775,8 @@ def _gen_cluster_daily(rng: random.Random):
             total_windows += up * 60
             idle_windows += idle * 60 + int(active * 60 * 0.7)
             peaks.append(pk)
-            cpu_sum += (0.02 * idle + 0.12 * active); cpu_n += up
+            cpu_sum += 0.02 * idle + 0.12 * active
+            cpu_n += up
             days.append({"d": d.isoformat(), "a": active, "i": idle, "pk": pk})
         else:
             days.append({"d": d.isoformat(), "a": 0, "i": 0, "pk": 0.0})

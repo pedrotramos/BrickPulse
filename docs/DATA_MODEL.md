@@ -58,8 +58,8 @@ by pipeline setting `brickpulse.pricing_mode`). `auto` probes `billing.account_p
 for rates overlapping the analysis window and uses it when accessible; `list` never
 reads that table; `account` requires accessible matching rates and fails the update
 otherwise. `billing.cloud_infra_cost` is an independent optional layer. The app's
-`BRICKPULSE_PRICING_MODE` should match the pipeline setting; the deployment notebook
-sets both. Without contract rates, rule SQL remains list-only.
+`BRICKPULSE_PRICING_MODE` should match the pipeline setting; the bundle's `pricing_mode`
+variable sets both. Without contract rates, rule SQL remains list-only.
 
 * **List stays the complete, ranking basis.** Rules compute list savings exactly as
   before; NBA order never changes with the basis.
@@ -225,7 +225,7 @@ creates, and it has two consequences worth knowing before you touch this:
 * **Delta-only writes fail against it.** Don't write to these tables yourself.
 
 `snapshot_date` is the read key and the DDL files in `src/brickpulse/pipelines/ddl/` document the
-contract, but nothing creates the tables from them: the deploy notebook leaves that
+contract, but nothing creates the tables from them: `scripts/deploy.py` leaves that
 to the pipeline, since a pre-created table makes it fail to materialize.
 
 ## Total workspace spend — `finops_workspace_spend`
@@ -494,9 +494,9 @@ day: a re-run replaces that day's ledger rows and events and rebuilds the daily 
 
 Table names default to siblings of `finops_table`; override with
 `FINOPS_FINDING_LEDGER_TABLE`, `FINOPS_CHANGE_EVENTS_TABLE`,
-`FINOPS_WORKSPACE_RETIREMENT_TABLE`, `FINOPS_SAVINGS_DAILY_TABLE`. The deploy notebook
+`FINOPS_WORKSPACE_RETIREMENT_TABLE`, `FINOPS_SAVINGS_DAILY_TABLE`. `scripts/deploy.py`
 grants the app's service principal SELECT on them; they exist only after the tracker's
-first run, so re-run its section 5 if they were reported as not created yet.
+first run, so run `scripts/deploy.py ... --refresh` if they were reported as missing.
 
 **What is tracked.** Every finding in the main set (no sidecar category, no Labs rule)
 that was non-advisory in at least one snapshot. Its **baseline** is its first ledger

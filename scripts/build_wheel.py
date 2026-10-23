@@ -20,7 +20,8 @@ def build():
         old.unlink()
     with TemporaryDirectory(prefix="brickpulse-wheel-") as scratch:
         stage = Path(scratch)
-        shutil.copy2(ROOT / "pyproject.toml", stage / "pyproject.toml")
+        for name in ("pyproject.toml", "README.md", "LICENSE", "NOTICE"):
+            shutil.copy2(ROOT / name, stage / name)
         shutil.copytree(ROOT / "src" / "brickpulse", stage / "src" / "brickpulse",
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.orig", ".DS_Store"))
         subprocess.run([sys.executable, "-m", "build", "--wheel", "--no-isolation",

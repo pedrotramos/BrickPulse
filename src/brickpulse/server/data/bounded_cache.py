@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from brickpulse.environment import get_env
 
-import os
 import threading
 import time
 from collections import OrderedDict

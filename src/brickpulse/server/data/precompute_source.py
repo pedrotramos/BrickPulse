@@ -10,7 +10,6 @@ from __future__ import annotations
 from brickpulse.environment import get_env
 
 import json
-import os as _os
 from datetime import datetime, timezone
 
 from ..identity import Scope

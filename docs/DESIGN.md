@@ -149,13 +149,13 @@ components:
 
 BrickPulse uses a light, precise workbench for engineers investigating Databricks spend and leaders reading the same evidence at a glance. Cool neutral surroundings, white work surfaces, graphite text and a petrol accent make financial facts, priorities and resource relationships easy to scan. Density comes from compact typography, aligned values and restrained dividers.
 
-The visual system keeps explanation beside the number: scope, period, confidence, source and freshness remain legible context. Panels organize evidence without decorative depth. The original Frequência mark provides identity through five rounded bars in Logo Orange; charts, tables and text provide the substance. The implemented interface requires no photographic or illustrative raster assets.
+The visual system keeps explanation beside the number: scope, period, confidence, source and freshness remain legible context. Panels organize evidence without decorative depth. The Frequência mark provides identity through five rounded bars in Logo Orange; charts, tables and text provide the substance. The implemented interface requires no photographic or illustrative raster assets.
 
 **Key Characteristics:**
 
 - Light neutral canvas and white analytical surfaces.
 - Graphite reading text with petrol actions, selection and opportunity values.
-- The original five-bar Frequência logo in orange, separate from the petrol interface accent.
+- The five-bar Frequência logo in orange, separate from the petrol interface accent.
 - Instrument Sans for interface language; JetBrains Mono for values and technical evidence.
 - Flat panels, precise dividers and compact controls.
 - Explicit financial context, honest unavailable states and accessible data alternatives.
@@ -172,7 +172,7 @@ The palette has a petrol interface accent, a separate orange logo, cool neutrals
 
 ### Secondary
 
-- **Logo Orange** (`logo-orange`): the original Frequência symbol in the sidebar and browser favicon. This is an SVG asset color, not a CSS custom property or a replacement for petrol actions and selection.
+- **Logo Orange** (`logo-orange`): the Frequência symbol in the sidebar and browser favicon. This is an SVG asset color, not a CSS custom property or a replacement for petrol actions and selection.
 
 ### Neutral
 
@@ -198,7 +198,7 @@ The palette has a petrol interface accent, a separate orange logo, cool neutrals
 
 **Data and Technical Font:** JetBrains Mono, with IBM Plex Mono and monospace fallbacks.
 
-Both active families are self-hosted through Fontsource imports in `frontend/src/main.tsx`. Instrument Sans and JetBrains Mono were the disclosed locally available substitution for IBM Plex. JetBrains Mono loads its regular (400) and medium (500) weights through unicode-range files, so browsers fetch only the subsets a page uses; metric values render at the medium weight.
+Both active families are self-hosted through Fontsource imports in `frontend/src/main.tsx`. IBM Plex is only a fallback; the bundled fonts need no network access. JetBrains Mono loads its regular (400) and medium (500) weights through unicode-range files, so browsers fetch only the subsets a page uses; metric values render at the medium weight.
 
 The hierarchy is compact and role-based rather than a regular mathematical scale. The frontmatter records desktop roles. Page headings shrink on narrow screens; data values adjust to their container.
 
@@ -241,11 +241,11 @@ Motion is limited to control background/color feedback (0.16s ease-out) and draw
 
 ## Shapes
 
-Panels and findings use softly rounded corners from the panel token. Controls and navigation use the control token; badges use the tighter badge token. The menu has its own corner size, and heatmap cells have a minimal rounding. Borders remain crisp and one pixel wide. The original Frequência brand mark is a vector of five vertical rounded bars in a square viewBox (96 × 96): each bar is (12) units wide with a corner radius (6), and their heights are (22, 50, 80, 44, 24) units from left to right.
+Panels and findings use softly rounded corners from the panel token. Controls and navigation use the control token; badges use the tighter badge token. The menu has its own corner size, and heatmap cells have a minimal rounding. Borders remain crisp and one pixel wide. The Frequência brand mark is a vector of five vertical rounded bars in a square viewBox (96 × 96): each bar is (12) units wide with a corner radius (6), and their heights are (22, 50, 80, 44, 24) units from left to right.
 
 **The Shape Hierarchy Rule.** Keep work surfaces, controls and status tags on their existing separate corner sizes; this small hierarchy supplies the workbench's form language.
 
-**The Original Logo Rule.** Use the exact original Frequência symbol from `docs/brand/brickpulse-symbol-color.svg`, preserving all five rounded bars, their positions and Logo Orange. The sidebar and favicon use the same SVG; do not redraw, recolor or combine the approved symbol with another mark.
+**The Logo Rule.** Use the exact Frequência symbol from `docs/brand/brickpulse-symbol-color.svg`, preserving all five rounded bars, their positions and Logo Orange. The sidebar and favicon use the same SVG; do not redraw, recolor or combine the symbol with another mark.
 
 ## Components
 

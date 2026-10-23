@@ -58,7 +58,6 @@ from brickpulse.rules.history import history_evidence, history_note, insufficien
 from brickpulse.rules.pricing import to_monthly
 from brickpulse.rules.registry import register
 from brickpulse.rules.savings import (
-    ENABLE_BASELINE_AUTOSTOP_MIN,
     MAX_AUTOSTOP_MINUTES_SERVERLESS,
     MAX_EXTRA_STOPS_PER_DAY,
     MAX_EXTRA_STOPS_PER_DAY_CHURNY,
@@ -281,11 +280,11 @@ class WarehouseAutoStopServerlessRule(Rule):
             )
         if high_churn:
             how += (
-                f" Before you do: check WHAT is querying it on that cadence (Query "
-                f"History, grouped by user/application). If it is a scheduled "
-                f"refresh that can tolerate a few seconds of start-up, take the "
-                f"saving; if users are waiting on it interactively, leave the "
-                f"auto-stop where it is and treat this finding as informational."
+                " Before you do: check WHAT is querying it on that cadence (Query "
+                "History, grouped by user/application). If it is a scheduled "
+                "refresh that can tolerate a few seconds of start-up, take the "
+                "saving; if users are waiting on it interactively, leave the "
+                "auto-stop where it is and treat this finding as informational."
             )
         else:
             how += (

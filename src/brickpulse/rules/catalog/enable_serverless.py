@@ -221,8 +221,8 @@ class EnableServerlessRule(Rule):
             f"At least ~${low:,.0f}/mo is measurable from the DBU bill alone; the rest "
             f"depends on the estimated cloud VM. "
             if low > 0 else
-            f"On DBUs alone serverless is not cheaper for this warehouse — the saving "
-            f"rests entirely on the estimated cloud VM it folds in. "
+            "On DBUs alone serverless is not cheaper for this warehouse — the saving "
+            "rests entirely on the estimated cloud VM it folds in. "
         )
         why = (
             f"{tier_label} SQL warehouse '{name}' cost ~${mig.all_in_monthly_est:,.0f}/mo "

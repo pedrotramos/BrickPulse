@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from brickpulse.environment import get_env
 
+import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from brickpulse.rules import (
@@ -43,8 +44,6 @@ log = get_logger(__name__)
 # full cost. Enabled by FINOPS_LIVE_CACHE_TTL (seconds); 0/unset = no caching
 # (unchanged behaviour). Keyed by (catalog, scope) so the workspace switcher and
 # per-workspace views cache independently.
-import os as _os
-import time as _time
 
 _LIVE_CACHE_TTL = float(get_env("FINOPS_LIVE_CACHE_TTL", "0") or "0")
 _LIVE_CACHE: dict[tuple, tuple[float, list]] = {}

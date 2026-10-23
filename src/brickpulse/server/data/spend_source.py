@@ -48,7 +48,6 @@ log = get_logger(__name__)
 #: Cache TTL (seconds). Spend is recomputed daily by the job, so a few minutes of
 #: staleness is irrelevant, while re-scanning billing.usage on every page view is not
 #: free. Overridable via FINOPS_SPEND_CACHE_TTL.
-import os as _os
 
 _CACHE_TTL_S = int(get_env("FINOPS_SPEND_CACHE_TTL", "300") or "300")
 # LRU bound by workspaces (~17 KB each cached), the bulk of an entry.

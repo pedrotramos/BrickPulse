@@ -47,6 +47,7 @@ sync:
   # that also exists under src/: the app runs from these synced sources.
   exclude:
     - .venv/**
+    - .github/**
     - frontend/**
     - node_modules/**
     - .impeccable/**

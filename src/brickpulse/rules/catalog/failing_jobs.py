@@ -91,7 +91,6 @@ class FailingJobsRule(Rule):
 
         # Real billed dollars burned on failed runs, normalized to a month.
         failed_cost_monthly = to_monthly(row.get("failed_cost_30d") or 0.0, ctx.lookback_days)
-        total_cost_monthly = to_monthly(row.get("cost_30d_usd") or 0.0, ctx.lookback_days)
 
         # Mean per-run cost of a failed vs a successful run of THIS job. Computed
         # from raw window totals (both over the same lookback), so their ratio is

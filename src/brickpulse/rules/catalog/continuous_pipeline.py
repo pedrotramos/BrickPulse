@@ -32,7 +32,6 @@ from brickpulse.rules.evidence import (
     CONFIDENCE_HIGH,
     evidence_block,
     calendar_grid,
-    hourly_states_to_grid,
     viz_hour_heatmap,
 )
 from brickpulse.rules.history import history_evidence, history_note, insufficient_history

@@ -154,9 +154,9 @@ class WarehouseScaleOutRule(Rule):
         spill_clause = (
             f" Separately, {spilled_pct:.0f}% of queries also spilled to disk"
             + (f" (worst: {max_spill_gb:.1f} GB)" if max_spill_gb >= 0.1 else "")
-            + f", so a larger size may help those specific queries — but the queueing "
-            f"itself is a concurrency problem that more clusters, not a bigger size, "
-            f"fixes."
+            + ", so a larger size may help those specific queries — but the queueing "
+            "itself is a concurrency problem that more clusters, not a bigger size, "
+            "fixes."
             if spilled_pct >= 1.0
             else " These queries are not spilling to disk, so the shortage is "
             "concurrency (too few clusters), not per-query memory (size) — adding a "

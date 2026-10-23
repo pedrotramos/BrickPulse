@@ -1,0 +1,19 @@
+BrickPulse
+Copyright 2026 Pedro Teófilo Ramos and BrickPulse contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+BrickPulse is an independent open-source project. It is not affiliated with,
+endorsed by or sponsored by Databricks, Inc. "Databricks" is a trademark of
+Databricks, Inc.
+
+This product bundles third-party software in its compiled frontend
+(src/brickpulse/server/static), each under its own license:
+
+* Instrument Sans, Copyright 2022 The Instrument Sans Project Authors,
+  SIL Open Font License 1.1 (see docs/brand/FONT-LICENSE.txt).
+* JetBrains Mono, Copyright 2020 The JetBrains Mono Project Authors,
+  SIL Open Font License 1.1.
+* npm packages listed in frontend/package.json (React, React Router,
+  TanStack Query, i18next, Recharts, Radix UI, lucide-react), under their
+  respective MIT or ISC licenses.

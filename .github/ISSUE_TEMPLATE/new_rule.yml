@@ -1,0 +1,54 @@
+name: New cost rule
+description: Propose a new cost-saving rule.
+labels: [new-rule]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Rules are plugins: a Python class, a Jinja SQL template and a thresholds block.
+        See [ADDING_A_RULE.md](https://github.com/pedrotramos/BrickPulse/blob/main/docs/ADDING_A_RULE.md).
+  - type: input
+    id: resource
+    attributes:
+      label: Resource type
+      placeholder: SQL warehouse, job cluster, serving endpoint, table...
+    validations:
+      required: true
+  - type: textarea
+    id: waste
+    attributes:
+      label: What waste does it detect?
+      description: Describe the pattern and why it costs money.
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: System tables
+      description: Which `system.*` tables provide the evidence? Are they generally available on all clouds?
+      placeholder: system.billing.usage, system.compute.node_timeline
+    validations:
+      required: true
+  - type: textarea
+    id: detection
+    attributes:
+      label: Detection logic and thresholds
+      description: How is a candidate identified? Which thresholds should be configurable?
+    validations:
+      required: true
+  - type: textarea
+    id: savings
+    attributes:
+      label: Savings estimate
+      description: How should monthly savings be estimated, and what makes the estimate uncertain?
+  - type: textarea
+    id: action
+    attributes:
+      label: Recommended action
+      description: What should the user change, and how much effort does it take?
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd like to implement this rule myself.

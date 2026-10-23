@@ -1,8 +1,31 @@
 [project]
 name = "brickpulse"
 version = "0.1.0"
-description = "Evidence-led Databricks financial observability"
+description = "Evidence-led, read-only FinOps app for Databricks: spend, savings opportunities and the evidence behind them"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Pedro Teófilo Ramos" }]
 requires-python = ">=3.10"
+keywords = ["databricks", "finops", "cost-optimization", "observability", "databricks-apps", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Natural Language :: Portuguese (Brazilian)",
+    "Natural Language :: Spanish",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: System :: Monitoring",
+]
 dependencies = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
@@ -21,8 +44,14 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "httpx>=0.28", "build>=1", "ruff>=0.11"]
 
+[project.urls]
+Homepage = "https://github.com/pedrotramos/BrickPulse"
+Documentation = "https://github.com/pedrotramos/BrickPulse/tree/main/docs"
+Issues = "https://github.com/pedrotramos/BrickPulse/issues"
+Changelog = "https://github.com/pedrotramos/BrickPulse/blob/main/CHANGELOG.md"
+
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
