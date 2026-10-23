@@ -203,10 +203,14 @@ test("observed metrics read as names with their system-table source", async ({
   await expect(
     metrics.locator("td code", { hasText: /^observed_days$/ }),
   ).toHaveCount(0);
-  await metrics.getByRole("button", { name: "About: Days observed" }).click();
-  await expect(page.locator(".info-tip-bubble")).toContainText(
-    "system.billing.usage",
-  );
+  // The toggletip closes on scroll, and a late scroll can land right after the click.
+  await expect(async () => {
+    await metrics.getByRole("button", { name: "About: Days observed" }).click();
+    await expect(page.locator(".info-tip-bubble")).toContainText(
+      "system.billing.usage",
+      { timeout: 1_000 },
+    );
+  }).toPass();
 });
 
 test("the state heatmap reads out hours and lists a day's periods", async ({
