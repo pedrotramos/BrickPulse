@@ -298,7 +298,7 @@ On a resource with several overlapping options, the best-ranked option opens exp
 
 Information and warning notices use their own light fills, border treatments and explicit copy. Empty, error and loading states reserve a stable content area. Errors expose retry; empty states link to data health or offer filter reset. Skeletons are static blocks. Missing data retains an honest unavailable state and accompanying context.
 
-The sidecar contains self-contained previews of ten implemented primitives. Its example amounts, resource names and dates are illustrative preview content, not product claims. The synthetic tonal ramps are preview metadata, not additional application colors. Finish-review scope and runtime limitations remain in `.impeccable/review/finish-review.md`; this document records the implemented system and does not extend that verdict.
+This document records the implemented system; it is not a design review verdict.
 
 ## Do's and Don'ts
 

@@ -20,7 +20,7 @@ release/
 build/
 .env*
 .databricks/
-.impeccable/review/
+.impeccable/
 playwright-report/
 test-results/
 

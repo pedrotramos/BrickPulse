@@ -22,7 +22,7 @@ O FastAPI real em modo demo respondeu via transporte local exclusivo de desenvol
 - Overview em viewport real de 390 × 844 sem overflow da página; tabelas mantêm regiões de rolagem próprias.
 - Menu mobile: foco inicial, contenção com Tab/Shift+Tab, background inert, Escape e retorno do foco ao botão de abertura.
 
-Capturas válidas em `.impeccable/review/desktop.png` e `mobile.png`. A revisão independente final aprovou **os dois ajustes avaliados**: contraste de metadados/rodapé e período da economia acumulada. Isso não é uma certificação de acessibilidade ou revisão exaustiva do produto. O sistema visual implementado está em DESIGN.md e no sidecar schemaVersion 2.
+A revisão independente final aprovou **os dois ajustes avaliados**: contraste de metadados/rodapé e período da economia acumulada. Isso não é uma certificação de acessibilidade ou revisão exaustiva do produto. O sistema visual implementado está em DESIGN.md.
 
 O Playwright lista dez cenários (cinco por viewport), mas **não foi executado com sucesso**: o ambiente restringe abertura do browser/socket. Na última tentativa, a inicialização do servidor falhou com `listen EPERM 127.0.0.1:5173`. As verificações no navegador conectado não são contabilizadas como testes Playwright aprovados.
 
