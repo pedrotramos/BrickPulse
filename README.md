@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/brand/brickpulse-lockup-color.svg" alt="BrickPulse" width="320">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/brickpulse-lockup-color-dark.svg">
+    <img src="docs/brand/brickpulse-lockup-color.svg" alt="BrickPulse" width="320">
+  </picture>
 </p>
 
 <p align="center">

@@ -9,6 +9,7 @@ The logo color is separate from the interface's petrol accent.
 | `brickpulse-symbol-mono.svg` | Single-color symbol. |
 | `brickpulse-symbol-reversed.svg` | White symbol for dark backgrounds (transparent background). |
 | `brickpulse-lockup-*.svg` | Symbol with the name, in the same three versions. |
+| `brickpulse-lockup-color-dark.svg` | Color lockup for dark backgrounds: orange symbol, white name. The READMEs switch to it in dark mode. |
 
 Don't redraw, recolor or combine the symbol with another mark. The lockups embed the Instrument Sans font as
 WOFF2, under the SIL Open Font License 1.1 (`FONT-LICENSE.txt`).
