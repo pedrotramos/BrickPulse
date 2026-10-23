@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: write  # push the rebuilt UI to the PR branch
-  actions: write   # start CI on the new commit
 
 concurrency:
   group: dependabot-frontend-${{ github.head_ref }}
@@ -34,9 +33,9 @@ jobs:
         run: npm --prefix frontend ci
       - name: Build
         run: npm run build
+      # The push starts CI on the PR again, this time with the rebuilt UI.
       - name: Commit the rebuilt UI
         env:
-          GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.head_ref }}
         run: |
           if [ -z "$(git status --porcelain -- src/brickpulse/server/static)" ]; then
@@ -48,5 +47,3 @@ jobs:
           git add -A src/brickpulse/server/static
           git commit -m "Rebuild the frontend for the dependency update"
           git push origin "HEAD:$BRANCH"
-          # A push made with GITHUB_TOKEN starts no workflow; dispatch CI for the new commit.
-          gh workflow run ci.yml --ref "$BRANCH"
