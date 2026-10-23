@@ -1,0 +1,272 @@
+{#
+  Shared SQL macros for rule templates.
+
+  Every rule attributes real dollars by joining system.billing.usage to
+  system.billing.list_prices. That join was copy-pasted into 14 templates and
+  carried two defects in every copy, so it now lives here and is imported:
+
+      {% import '_macros.sql.j2' as m with context %}
+      ...
+      SUM(u.usage_quantity * {{ m.price_rate() }}) AS cost_30d_usd,
+      SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+      FROM {{ tbl('billing','usage') }} u
+      {{ m.price_join() }}
+
+  DEFECT 1 — under-specified join key (silent fan-out risk).
+  list_prices is keyed on (sku_name, cloud, currency_code, usage_unit) plus a
+  [price_start_time, price_end_time) validity window. Joining on sku_name and
+  the window alone is only unambiguous in an account that bills one cloud in one
+  currency; add a second cloud or a non-USD currency and each usage row matches
+  several price rows, multiplying that row's usage_quantity into the SUM. The
+  dollars then silently inflate — the same class of bug as the MAX()-across-SKU-
+  variants defect fixed earlier in interactive_to_job.
+
+  DEFECT 2 — wrong price field (measured: +5.54%, ~$37k/30d in one account).
+  We read pricing.default, but Databricks documents pricing.effective_list.default
+  as the field for calculating cost: it resolves list against any promotional
+  price. 300 of 1063 price rows in the verified account carry a promotional price,
+  differing from default by up to $0.45/DBU. Using default overstates spend, and
+  an overstated baseline overstates savings — which breaks the engine's core
+  invariant that an estimate must never exceed true avoidable spend.
+
+  UNPRICED USAGE. price_rate() deliberately does NOT COALESCE a missed match to
+  0. A miss yields NULL, and SUM ignores NULLs, so the dollar total is unchanged
+  — but the usage no longer vanishes without trace: unpriced_dbus() counts it so
+  score() can report coverage instead of quietly under-reporting cost. Some SKUs
+  are legitimately unpriced (GENIE_FREE_USAGE is free-tier and has no list price
+  at all), which is exactly why this needs to be a visible number rather than an
+  assumption. See finops_rules.coverage.
+#}
+
+{#- The canonical list_prices join. `alias` names the price table (rules that
+    need two price lookups, e.g. interactive_to_job, pass distinct aliases);
+    `usage` is the alias of the billing.usage row being priced.
+
+    `sku_expr` overrides which SKU to look up, for rules that price a
+    COUNTERPART SKU rather than the one that was billed — interactive_to_job
+    prices the JOBS_COMPUTE equivalent of an ALL_PURPOSE_COMPUTE row to get the
+    migration gap. The cloud/unit/currency/window keys still apply, so the
+    counterpart is always resolved in the same region and currency as the usage
+    it is compared against. -#}
+{% macro price_join(alias='lp', usage='u', sku_expr=None) -%}
+LEFT JOIN {{ tbl('billing','list_prices') }} {{ alias }}
+    ON {{ sku_expr or (usage ~ '.sku_name') }} = {{ alias }}.sku_name
+    AND {{ usage }}.cloud = {{ alias }}.cloud
+    AND {{ usage }}.usage_unit = {{ alias }}.usage_unit
+    AND {{ alias }}.currency_code = '{{ currency }}'
+    AND {{ usage }}.usage_end_time >= {{ alias }}.price_start_time
+    AND ({{ alias }}.price_end_time IS NULL OR {{ usage }}.usage_end_time < {{ alias }}.price_end_time)
+{%- endmacro %}
+
+{#- Per-DBU rate to multiply usage_quantity by. NULL when unpriced (see above). -#}
+{% macro price_rate(alias='lp') -%}
+CAST({{ alias }}.pricing.effective_list.default AS DOUBLE)
+{%- endmacro %}
+
+{#- Usage quantity that found no price. Wrap in SUM() and alias unpriced_dbus. -#}
+{% macro unpriced_dbus(usage='u', alias='lp') -%}
+CASE WHEN {{ alias }}.sku_name IS NULL THEN {{ usage }}.usage_quantity ELSE 0 END
+{%- endmacro %}
+
+
+{# ============================ observation window ===================
+  The canonical CLOSED-OPEN window predicate, shared by every rule and by the
+  backend spend/apps sources.
+
+  DEFECT (measured on every template): `col >= date_sub(current_date(), N)` is an
+  INCLUSIVE lower bound with NO upper bound. `date_sub` is inclusive at both ends,
+  so "30 days" actually spans 31 calendar dates, AND it lets today's PARTIAL,
+  still-accumulating hours into the sample. A partial current day drags every
+  average and utilization ratio down, and it makes the monthly extrapolation
+  (`to_monthly`, which divides by N) inconsistent with the window it measured.
+
+  window_lower(col) renders `col >= date_sub(current_date(), N) AND col < current_date()`
+  — exactly N COMPLETE days, [today-N, today), excluding partial today. It works
+  for a DATE column (usage_date, event_date) and for a TIMESTAMP column
+  (start_time, period_start_time, request_time, event_time): Spark compares the
+  timestamp against midnight-today, so `< current_date()` excludes all of today.
+
+  `days` overrides the lookback for a rule that intentionally samples a different
+  span (e.g. a 90-day scheduling history); the closed-open shape is unchanged. #}
+{% macro window_lower(col, days=None) -%}
+{{ col }} >= date_sub(current_date(), {{ lookback_days if days is none else days }}) AND {{ col }} < current_date()
+{%- endmacro %}
+
+
+{# ==================== canonical corrected cost ==================
+  ONE place that turns system.billing.usage into corrected USD, so the window,
+  billing corrections, pricing field, and coverage are identical across rules
+  instead of re-derived (and re-broken) per template.
+
+  * ALL record_types are summed. billing.usage is an ADDITIVE ledger: a
+    RETRACTION carries a NEGATIVE usage_quantity that cancels the superseded
+    ORIGINAL, and a RESTATEMENT re-adds the corrected amount. Summing every
+    record_type therefore yields the CORRECTED quantity; filtering to
+    record_type='ORIGINAL' keeps stale spend and drops the correction that
+    cancels it. Never add a record_type filter to an additive cost sum.
+  * effective_list price via price_rate(), left NULL on a miss (not COALESCE 0),
+    with the unmatched usage counted into unpriced_dbus so coverage.py can fail
+    closed on a poorly-priced resource.
+  * closed-open window via window_lower() — exactly N complete days.
+
+  Grain is (workspace_id, <id_col>). Pass the usage_metadata id to key on and the
+  output alias, e.g.
+      {{ m.usage_cost_cte('cost', 'u.usage_metadata.cluster_id', 'cluster_id') }}
+  emits: cost_30d_usd (corrected), dbus_30d (total qty), unpriced_dbus,
+  observed_days (distinct billed dates). Project dbus_30d + unpriced_dbus through
+  to the final SELECT so score() can call the coverage guard. #}
+{% macro usage_cost_cte(cte_name, id_col, id_alias) -%}
+{{ cte_name }} AS (
+  SELECT
+    u.workspace_id,
+    {{ id_col }} AS {{ id_alias }},
+    SUM(u.usage_quantity * {{ price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ unpriced_dbus() }}) AS unpriced_dbus,
+    COUNT(DISTINCT u.usage_date) AS observed_days{{ contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ price_join('lp') }}{{ contract_price_join() }}
+  WHERE {{ window_lower('u.usage_date') }}
+    AND {{ id_col }} IS NOT NULL
+  GROUP BY 1, 2
+)
+{%- endmacro %}
+
+
+{# ============================ current SCD row =======================
+  Selecting the CURRENT version of a slowly-changing dimension (clusters, jobs,
+  warehouses, pipelines, endpoints) has one correct shape and one seductive wrong
+  one.
+
+  WRONG (filters the deleted row away BEFORE ranking):
+      FROM scd WHERE delete_time IS NULL
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY workspace_id, id ORDER BY change_time DESC) = 1
+  SQL applies WHERE before QUALIFY, so a resource whose LATEST row is its deletion
+  loses that row, and an OLDER, still-"live" version is ranked #1 and resurrected
+  as if it were current — a deleted resource keeps generating recommendations.
+
+  RIGHT (rank ALL versions, then test the selected row):
+      {{ m.latest_scd_cte('latest', tbl('compute','clusters'),
+                           'workspace_id, cluster_id',
+                           select_cols='workspace_id, cluster_id, cluster_name, delete_time',
+                           where="cluster_source IN ('UI','API')") }}
+  which renders rn over the FULL history (business filters that do not vary by
+  version may still go in `where` to cut the scan), then keeps
+  `rn = 1 AND delete_time IS NULL`. `delete_col` names the deletion column when it
+  is not the default `delete_time` (idle_serving_endpoints projects
+  endpoint_delete_time). idle_zombie_clusters is the hand-written reference. #}
+{% macro latest_scd_cte(cte_name, relation, partition_by, select_cols='*', where=None, order_by='change_time DESC', delete_col='delete_time') -%}
+{{ cte_name }} AS (
+  SELECT * FROM (
+    SELECT {{ select_cols }},
+           ROW_NUMBER() OVER (PARTITION BY {{ partition_by }} ORDER BY {{ order_by }}) AS rn
+    FROM {{ relation }}
+    {%- if where %}
+    WHERE {{ where }}
+    {%- endif %}
+  )
+  WHERE rn = 1 AND {{ delete_col }} IS NULL
+)
+{%- endmacro %}
+
+
+{# ================= Contract rates + cloud VM cost (capability-gated) =========
+  Optional price sources, detected per run (finops_rules.price_basis.probe_capabilities)
+  and passed in as the Jinja flags `contract_prices` / `cloud_costs`. Every macro
+  below renders to the EMPTY STRING when its flag is off, so with no
+  account_prices / cloud_infra_cost data the rendered SQL is byte-identical to the
+  list-only SQL (the golden / SDP-parity tests depend on this). Call them INLINE,
+  glued to the preceding token, because each one supplies its own leading newline:
+
+      SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+      FROM {{ tbl('billing','usage') }} u
+      {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+      ...
+      SELECT ..., COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('cost') }}
+
+  The engine turns the two emitted RATIOS into contract figures centrally
+  (finops_rules.price_basis) — rules never write contract-pricing logic. Ratios,
+  not dollar sums, because many templates scale their cost CTE downstream; a ratio
+  survives that scaling, a sum does not. #}
+
+{#- system.billing.account_prices, keyed exactly like price_join. -#}
+{% macro contract_price_join(alias='ap', usage='u', sku_expr=None) -%}
+{%- if contract_prices %}
+LEFT JOIN {{ tbl('billing','account_prices') }} {{ alias }}
+    ON {{ sku_expr or (usage ~ '.sku_name') }} = {{ alias }}.sku_name
+    AND {{ usage }}.cloud = {{ alias }}.cloud
+    AND {{ usage }}.usage_unit = {{ alias }}.usage_unit
+    AND {{ alias }}.currency_code = '{{ currency }}'
+    AND {{ usage }}.usage_end_time >= {{ alias }}.price_start_time
+    AND ({{ alias }}.price_end_time IS NULL OR {{ usage }}.usage_end_time < {{ alias }}.price_end_time)
+{%- endif %}
+{%- endmacro %}
+
+{#- Contract per-unit rate. account_prices.pricing is struct<default:decimal> (verified
+    2026-09-23; there is no effective_list on it). -#}
+{% macro contract_rate(alias='ap') -%}
+CAST({{ alias }}.pricing.default AS DOUBLE)
+{%- endmacro %}
+
+{#- Two aggregate columns for the cost CTE (leading comma included):
+    contract_ratio          — contract $ / list $ over usage priced on BOTH bases;
+    contract_price_coverage — share of usage quantity priced on both bases. -#}
+{% macro contract_cost_cols(usage='u', lp='lp', ap='ap') -%}
+{%- if contract_prices %},
+    SUM(CASE WHEN {{ ap }}.sku_name IS NOT NULL AND {{ lp }}.sku_name IS NOT NULL
+             THEN {{ usage }}.usage_quantity * {{ contract_rate(ap) }} END)
+      / NULLIF(SUM(CASE WHEN {{ ap }}.sku_name IS NOT NULL AND {{ lp }}.sku_name IS NOT NULL
+             THEN {{ usage }}.usage_quantity * {{ price_rate(lp) }} END), 0) AS contract_ratio,
+    SUM(CASE WHEN {{ ap }}.sku_name IS NOT NULL AND {{ lp }}.sku_name IS NOT NULL
+             THEN {{ usage }}.usage_quantity ELSE 0 END)
+      / NULLIF(SUM({{ usage }}.usage_quantity), 0) AS contract_price_coverage
+{%- endif %}
+{%- endmacro %}
+
+{#- Project the two ratios from CTE `alias` into a SELECT list. Default: trailing
+    comma, so place it right after a column that already ends in a comma. lead=True:
+    leading comma instead, for the END of a select list (glue it to the last column). -#}
+{% macro contract_cost_select(alias, lead=False) -%}
+{%- if contract_prices %}{{ ',' if lead }}
+  {{ alias }}.contract_ratio,
+  {{ alias }}.contract_price_coverage{{ ',' if not lead }}
+{%- endif %}
+{%- endmacro %}
+
+{#- A 30-day classic cloud-VM cost CTE from system.billing.cloud_infra_cost, keyed on
+    one usage_metadata id (cluster_id | warehouse_id | instance_pool_id). Leading comma
+    included, so glue it to the closing paren of the preceding CTE:
+        ){{ m.cloud_cost_cte('cloud_cost', 'cluster_id') }}
+    Emits workspace_id, <key>, cloud_cost_30d_usd, cloud_observed_days. -#}
+{% macro cloud_cost_cte(cte_name, key) -%}
+{%- if cloud_costs %},
+{{ cte_name }} AS (
+  SELECT
+    ci.workspace_id,
+    ci.usage_metadata.{{ key }} AS {{ key }},
+    SUM(CAST(ci.cost AS DOUBLE)) AS cloud_cost_30d_usd,
+    COUNT(DISTINCT ci.usage_date) AS cloud_observed_days
+  FROM {{ tbl('billing','cloud_infra_cost') }} ci
+  WHERE {{ window_lower('ci.usage_date') }}
+    AND ci.currency_code = '{{ currency }}'
+    AND ci.usage_metadata.{{ key }} IS NOT NULL
+  GROUP BY 1, 2
+)
+{%- endif %}
+{%- endmacro %}
+
+{#- LEFT JOIN the cloud cost CTE onto `alias` (which must expose workspace_id + key). -#}
+{% macro cloud_cost_join(cte_name, alias, key, cc='cc') -%}
+{%- if cloud_costs %}
+LEFT JOIN {{ cte_name }} {{ cc }}
+  ON {{ cc }}.workspace_id = {{ alias }}.workspace_id AND {{ cc }}.{{ key }} = {{ alias }}.{{ key }}
+{%- endif %}
+{%- endmacro %}
+
+{#- Project the cloud cost into a SELECT list (trailing comma; lead=True for the
+    end of a list, as contract_cost_select). -#}
+{% macro cloud_cost_select(cc='cc', lead=False) -%}
+{%- if cloud_costs %}{{ ',' if lead }}
+  {{ cc }}.cloud_cost_30d_usd{{ ',' if not lead }}
+{%- endif %}
+{%- endmacro %}

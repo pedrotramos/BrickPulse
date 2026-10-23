@@ -1,0 +1,370 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: cluster_autotermination
+-- Candidate all-purpose (UI) clusters whose auto-termination is missing, zero,
+-- or longer than the acceptable threshold -- joined to their recent billed cost
+-- (usage x list_prices => real USD) and to idle-window counts from the node
+-- timeline so score() can confirm the cluster actually sits idle and price the
+-- avoidable spend.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py) so this same SQL serves both
+-- account-wide precompute and workspace-scoped live queries.
+WITH
+-- Current version per cluster via the shared latest_scd_cte macro:
+--   * rank-then-filter (rn = 1 AND delete_time IS NULL) so a cluster whose LATEST
+--     SCD row is its DELETION is dropped, not resurrected from an older live row;
+--   * portable Spark SQL, unlike the QUALIFY it replaces (a DBSQL-only extension
+--     open-source Spark cannot parse — the hermetic sample-data gate runs on Spark).
+-- The interactive-source gate (UI/API) is a business filter that does not vary by
+-- SCD version, so it rides in the macro's WHERE to cut the scan: interactive
+-- all-purpose clusters (UI, or API/Terraform/DAB), excluding only ephemeral
+-- platform-managed sources (JOB, PIPELINE, MODELS, SQL, ...). The rule keys on
+-- measured long idle gaps, so a short-lived API cluster torn down by its caller
+-- produces no reclaimable gaps and won't false-positive here.
+{{ m.latest_scd_cte(
+     'latest_clusters', tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, cluster_source,
+                  worker_node_type, auto_termination_minutes, dbr_version,
+                  worker_count, delete_time',
+     where="cluster_source IN ('UI', 'API')") }},
+candidates AS (
+  SELECT *
+  FROM latest_clusters
+  -- Candidate = auto-termination missing / zero / looser than acceptable. This
+  -- setting DOES vary by SCD version, so it is applied here on the CURRENT row
+  -- (the source + delete_time gates are already applied in latest_clusters above).
+  WHERE auto_termination_minutes IS NULL
+    OR auto_termination_minutes = 0
+    OR auto_termination_minutes > {{ max_acceptable_minutes }}
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'cluster_id') }},
+idle AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    COUNT_IF(cpu_user_percent + cpu_system_percent < 10) AS idle_windows,
+    COUNT(*) AS total_windows,
+    -- Distinct calendar days the cluster was seen running. One afternoon of idle
+    -- gaps says nothing about the cluster's habitual pattern, so score()
+    -- suppresses rows below min_observation_days (finops_rules.history).
+    COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+  GROUP BY 1, 2
+),
+-- Gap-based reclaimable idle. Auto-termination only reclaims CONTIGUOUS idle
+-- gaps longer than the (proposed) timeout -- scattered idle minutes between
+-- bursts, shorter than the timeout, are never reclaimed. We collapse to one CPU
+-- value per cluster-minute (across nodes), sessionize contiguous idle runs, and
+-- keep only the reclaimable tail of each long-enough run. This replaces the old
+-- flat idle-fraction, which over/under-counted via an arbitrary fudge factor.
+cluster_minute AS (
+  SELECT workspace_id, cluster_id,
+         unix_timestamp(date_trunc('MINUTE', start_time)) DIV 60 AS tm,
+         AVG(cpu_user_percent + cpu_system_percent) AS cpu
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+  GROUP BY 1, 2, 3
+),
+-- Minutes in which a JOB TASK was actually running on the cluster. A cluster can
+-- sit at low CPU while a job task is genuinely working (blocked on I/O, a slow
+-- shuffle, driver-bound work), so these minutes must NOT count as reclaimable
+-- idle. This is the command-level activity signal system tables DO expose.
+job_active_minutes AS (
+  SELECT workspace_id, cluster_id, tm
+  FROM (
+    SELECT t.workspace_id,
+           explode(t.compute_ids) AS cluster_id,
+           explode(sequence(
+             unix_timestamp(date_trunc('MINUTE', t.period_start_time)) DIV 60,
+             unix_timestamp(date_trunc('MINUTE', t.period_end_time)) DIV 60
+           )) AS tm
+    FROM {{ tbl('lakeflow','job_task_run_timeline') }} t
+    WHERE {{ m.window_lower('t.period_start_time') }}
+      AND size(t.compute_ids) > 0
+  )
+  GROUP BY 1, 2, 3
+),
+{% if use_audit_activity %}
+-- Optional: minutes in which a notebook command ran (audit log). Interactive
+-- notebook activity is otherwise invisible to system tables, so enabling this
+-- (use_audit_activity: true) removes the biggest source of false "idle" on
+-- interactive clusters. Requires system.access.audit enabled + SELECT.
+nb_active_minutes AS (
+  SELECT workspace_id, cluster_id, tm
+  FROM (
+    SELECT a.workspace_id,
+           a.request_params['clusterId'] AS cluster_id,
+           explode(sequence(
+             unix_timestamp(date_trunc('MINUTE',
+               a.event_time - make_interval(0, 0, 0, 0, 0, 0,
+                 COALESCE(TRY_CAST(a.request_params['executionTime'] AS DOUBLE), 0) / 1000.0)
+             )) DIV 60,
+             unix_timestamp(date_trunc('MINUTE', a.event_time)) DIV 60
+           )) AS tm
+    FROM {{ tbl('access','audit') }} a
+    WHERE a.service_name = 'notebook'
+      AND a.action_name = 'runCommand'
+      AND {{ m.window_lower('a.event_date') }}
+      AND a.request_params['clusterId'] IS NOT NULL
+  )
+  GROUP BY 1, 2, 3
+),
+{% endif %}
+-- A running minute is ACTIVE if CPU >= 10%, OR a job task ran, OR (optionally) a
+-- notebook command ran. Any running minute not active by any signal is idle.
+active_minute AS (
+  SELECT workspace_id, cluster_id, tm FROM cluster_minute WHERE cpu >= 10
+  UNION
+  SELECT workspace_id, cluster_id, tm FROM job_active_minutes
+  {% if use_audit_activity %}
+  UNION
+  SELECT workspace_id, cluster_id, tm FROM nb_active_minutes
+  {% endif %}
+),
+-- Minutes the cluster was UP (billable) at all: every sampled node_timeline minute,
+-- UNION the active minutes — a job/notebook minute means the cluster was up even if
+-- node_timeline missed that sample. Guarantees up >= active per cell, so the
+-- heatmap's "up-but-idle" (up - active) is never negative.
+up_minute AS (
+  SELECT workspace_id, cluster_id, tm FROM cluster_minute
+  UNION
+  SELECT workspace_id, cluster_id, tm FROM active_minute
+),
+-- WHEN was the cluster actually used, as 7x24 day-of-week x hour matrices. A
+-- cluster that looks "always on" in a 24-bucket hour-of-day view is often idle
+-- every weekend / every night; summing all days into 24 buckets hides exactly the
+-- gaps auto-termination reclaims, so we keep the weekly rhythm. TWO matrices, so
+-- the heatmap can tell the three states apart the way the daily chart does:
+--   up_by_dow_hour     — minutes the cluster was RUNNING at all in that cell (any
+--                        node_timeline sample), i.e. billed time. up=0 => OFF.
+--   active_by_dow_hour — of those, minutes it was IN USE, from the SAME active
+--                        signal the idle sessionization uses (CPU >= 10% OR a job/
+--                        notebook ran), so the heatmap and the reclaimable-gap
+--                        figure agree by construction. up - active => up-but-idle
+--                        (the reclaimable waste).
+-- Both ALWAYS 168 elements, index == dow*24 + hour (dow 0=Mon..6=Sun), zero-filled
+-- via a 0..167 sequence for index safety.
+-- tm is a minute index (unix_timestamp DIV 60); tm*60 recovers the timestamp.
+-- Spark dayofweek() is 1=Sun..7=Sat; (dayofweek - 2 + 7) % 7 maps Mon->0..Sun->6.
+dow_activity AS (
+  SELECT COALESCE(a.workspace_id, u.workspace_id) AS workspace_id,
+         COALESCE(a.cluster_id, u.cluster_id) AS cluster_id,
+         transform(sequence(0, 167), k -> COALESCE(element_at(a.dh_map, k), 0)) AS active_by_dow_hour,
+         transform(sequence(0, 167), k -> COALESCE(element_at(u.dh_map, k), 0)) AS up_by_dow_hour
+  FROM (
+    SELECT workspace_id, cluster_id,
+           map_from_entries(collect_list(struct(dh_key, n))) AS dh_map
+    FROM (
+      SELECT workspace_id, cluster_id,
+             ((dayofweek(CAST(tm * 60 AS TIMESTAMP)) - 2 + 7) % 7) * 24
+               + hour(CAST(tm * 60 AS TIMESTAMP)) AS dh_key,
+             COUNT(*) AS n
+      FROM active_minute
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  ) a
+  FULL OUTER JOIN (
+    -- Up-minutes per cell (sampled OR active — see up_minute), so up >= active.
+    SELECT workspace_id, cluster_id,
+           map_from_entries(collect_list(struct(dh_key, n))) AS dh_map
+    FROM (
+      SELECT workspace_id, cluster_id,
+             ((dayofweek(CAST(tm * 60 AS TIMESTAMP)) - 2 + 7) % 7) * 24
+               + hour(CAST(tm * 60 AS TIMESTAMP)) AS dh_key,
+             COUNT(*) AS n
+      FROM up_minute
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  ) u
+  ON a.workspace_id = u.workspace_id AND a.cluster_id = u.cluster_id
+),
+-- Per hour-of-day x minute-of-hour active counts (1440 = 24*60, index h*60+m),
+-- so the detail page can drill from an hour into the minutes inside it: a tight
+-- spike on one minute (e.g. :00) is a scheduled poller that makes a short timeout
+-- churny, whereas spread-out minutes are genuine ad-hoc use. Active minutes only.
+hour_minute_activity AS (
+  SELECT workspace_id, cluster_id,
+         transform(sequence(0, 1439), k -> COALESCE(element_at(hm_map, k), 0)) AS active_by_hour_minute
+  FROM (
+    SELECT workspace_id, cluster_id,
+           map_from_entries(collect_list(struct(hm_key, n))) AS hm_map
+    FROM (
+      SELECT workspace_id, cluster_id,
+             hour(CAST(tm * 60 AS TIMESTAMP)) * 60
+               + minute(CAST(tm * 60 AS TIMESTAMP)) AS hm_key,
+             COUNT(*) AS n
+      FROM active_minute
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  )
+),
+idle_flagged AS (
+  SELECT cm.workspace_id, cm.cluster_id, cm.tm,
+         CASE WHEN am.tm IS NULL THEN 1 ELSE 0 END AS idle
+  FROM cluster_minute cm
+  LEFT JOIN active_minute am
+    ON cm.workspace_id = am.workspace_id
+   AND cm.cluster_id = am.cluster_id
+   AND cm.tm = am.tm
+),
+minute_island AS (
+  SELECT workspace_id, cluster_id, tm, idle,
+         SUM(new_island) OVER (PARTITION BY workspace_id, cluster_id ORDER BY tm) AS island
+  FROM (
+    SELECT workspace_id, cluster_id, tm, idle,
+           CASE WHEN idle = 1
+                     AND LAG(idle)
+                           OVER (PARTITION BY workspace_id, cluster_id ORDER BY tm) = 1
+                     AND LAG(tm) OVER (PARTITION BY workspace_id, cluster_id ORDER BY tm) = tm - 1
+                THEN 0 ELSE 1 END AS new_island
+    FROM idle_flagged
+  )
+),
+idle_runs AS (
+  SELECT workspace_id, cluster_id, island, COUNT(*) AS len
+  FROM minute_island WHERE idle = 1 GROUP BY 1, 2, 3
+),
+gaps AS (
+  SELECT workspace_id, cluster_id,
+         SUM(len) AS idle_minutes,
+         SUM(CASE WHEN len > {{ max_acceptable_minutes }} THEN len - {{ max_acceptable_minutes }} ELSE 0 END) AS reclaimable_gross_min,
+         SUM(CASE WHEN len > {{ max_acceptable_minutes }} THEN 1 ELSE 0 END) AS num_reclaim_gaps,
+         MAX(len) AS longest_idle_gap_min
+  FROM idle_runs GROUP BY 1, 2
+),
+running AS (
+  SELECT workspace_id, cluster_id, COUNT(*) AS running_minutes
+  FROM cluster_minute GROUP BY 1, 2
+),
+-- Real job activity on the cluster (the one command-level signal system tables
+-- expose for compute); interactive notebook activity is NOT captured anywhere,
+-- which is why this rule is medium-confidence.
+-- NB: only job_task_run_timeline populates compute_ids; job_run_timeline leaves
+-- it empty, so the cluster<->job link must come from the TASK-level table.
+jobs AS (
+  SELECT workspace_id, cluster_id, COUNT(*) AS job_runs_30d
+  FROM (
+    SELECT workspace_id, run_id, explode(compute_ids) AS cluster_id
+    FROM {{ tbl('lakeflow','job_task_run_timeline') }}
+    WHERE {{ m.window_lower('period_start_time') }}
+      AND size(compute_ids) > 0
+  )
+  GROUP BY 1, 2
+),
+-- Hourly RESOURCE series so score() can chart what the cluster is actually doing
+-- on the detail page: CPU alone can't distinguish "oversized" from "memory-bound"
+-- or "I/O-starved", and those need different actions. Memory/swap/io-wait/network
+-- travel index-aligned with cpu_ts. (node_timeline has no disk read/write rate —
+-- only free space per mount point — so CPU I/O wait stands in for storage pressure.)
+cpu_series AS (
+  SELECT workspace_id, cluster_id,
+         transform(sorted, x -> x.cpu) AS cpu_hourly,
+         transform(sorted, x -> x.ts) AS cpu_ts,
+         transform(sorted, x -> x.idle) AS idle_frac,
+         transform(sorted, x -> x.peak) AS cpu_peak,
+         transform(sorted, x -> x.mem) AS mem_hourly,
+         transform(sorted, x -> x.swap) AS swap_hourly,
+         transform(sorted, x -> x.iowait) AS iowait_hourly,
+         transform(sorted, x -> x.net) AS net_hourly,
+         p95_cpu,
+         avg_mem_pct,
+         peak_mem_pct
+  FROM (
+    SELECT workspace_id, cluster_id,
+           array_sort(
+             collect_list(struct(h AS h, cpu AS cpu, unix_timestamp(h) AS ts, idle AS idle,
+                                 peak AS peak, mem AS mem, swap AS swap,
+                                 iowait AS iowait, net AS net)),
+             (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END
+           ) AS sorted,
+           percentile_approx(cpu, 0.95) AS p95_cpu,
+           AVG(mem) * 100.0 AS avg_mem_pct,
+           MAX(mem) * 100.0 AS peak_mem_pct
+    FROM (
+      SELECT workspace_id, cluster_id, date_trunc('HOUR', start_time) AS h,
+             AVG(cpu_user_percent + cpu_system_percent) / 100.0 AS cpu,
+             AVG(CASE WHEN cpu_user_percent + cpu_system_percent < 10 THEN 1.0 ELSE 0.0 END) AS idle,
+             MAX(cpu_user_percent + cpu_system_percent) / 100.0 AS peak,
+             AVG(mem_used_percent) / 100.0 AS mem,
+             AVG(COALESCE(mem_swap_percent, 0)) / 100.0 AS swap,
+             AVG(COALESCE(cpu_wait_percent, 0)) / 100.0 AS iowait,
+             -- Bytes per minute across both directions, summed over nodes then
+             -- averaged over the hour's samples: a comparable throughput figure.
+             AVG(COALESCE(network_received_bytes, 0) + COALESCE(network_sent_bytes, 0)) AS net
+      FROM {{ tbl('compute','node_timeline') }}
+      WHERE {{ m.window_lower('start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  )
+)
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  -- Surfaced so the detail page can say WHAT this cluster is up front: an
+  -- all-purpose cluster idles between a human's commands, whereas a job cluster
+  -- should not be sitting idle at all. Same finding, different conversation.
+  c.cluster_source,
+  c.worker_node_type AS node_type_id,
+  c.auto_termination_minutes,
+  c.dbr_version,
+  c.worker_count,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('cost') }}{{ m.cloud_cost_select() }}
+  COALESCE(idle.idle_windows, 0) AS idle_windows,
+  COALESCE(idle.total_windows, 0) AS total_windows,
+  COALESCE(idle.observed_days, 0) AS observed_days,
+  COALESCE(gaps.idle_minutes, 0) AS idle_minutes,
+  COALESCE(gaps.reclaimable_gross_min, 0) AS reclaimable_gross_min,
+  COALESCE(gaps.num_reclaim_gaps, 0) AS num_reclaim_gaps,
+  COALESCE(gaps.longest_idle_gap_min, 0) AS longest_idle_gap_min,
+  COALESCE(running.running_minutes, 0) AS running_minutes,
+  COALESCE(jobs.job_runs_30d, 0) AS job_runs_30d,
+  cpu_series.cpu_hourly,
+  cpu_series.cpu_ts,
+  cpu_series.idle_frac,
+  cpu_series.cpu_peak,
+  cpu_series.mem_hourly,
+  cpu_series.swap_hourly,
+  cpu_series.iowait_hourly,
+  cpu_series.net_hourly,
+  cpu_series.p95_cpu,
+  cpu_series.avg_mem_pct,
+  cpu_series.peak_mem_pct,
+  -- 168-element weekday x hour matrices ("when was it used") — drive the detail-
+  -- page heatmap, the same panel the warehouse auto-stop rule shows. active = in
+  -- use, up = running at all; up-active = up-but-idle (the reclaimable waste).
+  dow_activity.active_by_dow_hour,
+  dow_activity.up_by_dow_hour,
+  -- 1440-element hour x minute matrix for the hour->minute zoom drill.
+  hour_minute_activity.active_by_hour_minute
+FROM candidates c
+LEFT JOIN cost USING (workspace_id, cluster_id){{ m.cloud_cost_join('cloud_cost', 'cost', 'cluster_id') }}
+LEFT JOIN idle USING (workspace_id, cluster_id)
+LEFT JOIN gaps USING (workspace_id, cluster_id)
+LEFT JOIN running USING (workspace_id, cluster_id)
+LEFT JOIN jobs USING (workspace_id, cluster_id)
+LEFT JOIN cpu_series USING (workspace_id, cluster_id)
+LEFT JOIN dow_activity USING (workspace_id, cluster_id)
+LEFT JOIN hour_minute_activity USING (workspace_id, cluster_id)

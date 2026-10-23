@@ -1,0 +1,119 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: pipeline_failed_updates  (Pipeline Events)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the pipeline's DLT usage)
+--   units:           update wall-seconds (period_end - period_start); dollars via the
+--                    pipeline's corrected DBU cost apportioned by the FAILED-update
+--                    duration share.
+--   counterfactual:  a pipeline update that ends FAILED / TIMED_OUT / ERROR did
+--                    compute and produced no committed output. A pipeline that fails
+--                    the same update repeatedly (a bad transform, a missing source, an
+--                    OOM) is directly avoidable work — fix or pause it and that update
+--                    time disappears. Whether the bill drops depends on whether the
+--                    compute would otherwise sit idle (continuous pipelines hold it up
+--                    regardless), so this is ADDRESSABLE spend, not a booked saving.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      addressable <= corrected pipeline cost (a share in [0,1] of the
+--                    same cost); closed-open window; corrections via the canonical cost
+--                    layer; coverage-guarded.
+--
+-- This COMPLEMENTS continuous_pipeline (which flags an always-on pipeline holding
+-- compute up while idle) — here we flag compute burned on updates that FAILED, a
+-- distinct waste the idle-hours rule does not see. Per-input-row "no useful work"
+-- detection would need each pipeline's Pipeline Events event_log (num_output_rows),
+-- for which there is NO account-wide system table, so this rule uses the update
+-- OUTCOME (result_state), which system.lakeflow.pipeline_update_timeline does carry.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH upd AS (  -- one row per pipeline update in the window, with day + failed flag + duration
+  SELECT
+    workspace_id,
+    pipeline_id,
+    update_id,
+    request_id,
+    result_state,
+    CAST(period_start_time AS DATE) AS day,
+    CASE WHEN result_state IN ('FAILED', 'TIMED_OUT', 'ERROR') THEN 1 ELSE 0 END AS failed,
+    GREATEST(
+      unix_timestamp(period_end_time) - unix_timestamp(period_start_time), 0
+    ) AS dur_s
+  FROM {{ tbl('lakeflow','pipeline_update_timeline') }}
+  WHERE result_state IS NOT NULL
+    AND {{ m.window_lower('period_start_time') }}
+),
+per_pl AS (
+  SELECT
+    workspace_id,
+    pipeline_id,
+    COUNT(DISTINCT update_id) AS updates,
+    -- Distinct days updates ran: a recurring cadence, not one bad afternoon.
+    COUNT(DISTINCT day) AS observed_days,
+    SUM(failed) AS failed_updates,
+    -- Retries/restarts share a request_id; distinct request_ids among failures shows
+    -- how many separate attempts kept failing (a genuine loop vs one flaky run).
+    COUNT(DISTINCT CASE WHEN failed = 1 THEN request_id END) AS failed_requests,
+    SUM(dur_s) AS total_dur_s,
+    SUM(CASE WHEN failed = 1 THEN dur_s ELSE 0 END) AS failed_dur_s
+  FROM upd
+  GROUP BY 1, 2
+  HAVING SUM(failed) >= {{ min_failed_updates }}
+),
+-- Per-day failed vs total updates, for the chart.
+daily AS (
+  SELECT workspace_id, pipeline_id, day,
+         COUNT(DISTINCT update_id) AS total, SUM(failed) AS failed
+  FROM upd
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, pipeline_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, total AS t, failed AS f)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 't', x.t, 'f', x.f)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+),
+-- Corrected pipeline cost: DLT usage, all record_types summed,
+-- effective_list rate, closed-open window, unpriced usage tracked for the guard.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.dlt_pipeline_id AS pipeline_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'DLT'
+    AND u.usage_metadata.dlt_pipeline_id IS NOT NULL
+  GROUP BY 1, 2
+),
+{{ m.latest_scd_cte(
+     'latest_pipelines',
+     tbl('lakeflow','pipelines'),
+     'workspace_id, pipeline_id',
+     select_cols='workspace_id, pipeline_id, name AS pipeline_name, delete_time') }}
+SELECT
+  p.workspace_id,
+  p.pipeline_id,
+  COALESCE(pl.pipeline_name, p.pipeline_id) AS pipeline_name,
+  p.updates,
+  p.observed_days,
+  p.failed_updates,
+  p.failed_requests,
+  ROUND(p.failed_updates / p.updates, 4) AS fail_rate,
+  p.total_dur_s,
+  p.failed_dur_s,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus,
+  da.days
+FROM per_pl p
+LEFT JOIN daily_arr da USING (workspace_id, pipeline_id)
+LEFT JOIN cost c USING (workspace_id, pipeline_id)
+LEFT JOIN latest_pipelines pl USING (workspace_id, pipeline_id)

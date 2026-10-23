@@ -1,0 +1,129 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: manual_maintenance_overlap  (Predictive Optimization
+-- duplication)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the warehouse's usage)
+--   units:           Spark task-milliseconds (slot occupancy); dollars via the
+--                    warehouse's corrected DBU cost apportioned by the maintenance
+--                    statements' task-ms share.
+--   counterfactual:  Predictive Optimization (PO) runs OPTIMIZE/VACUUM automatically
+--                    on enabled tables. A scheduled job doing the SAME maintenance on
+--                    those tables is redundant compute — dropping it removes that
+--                    work. We can measure the manual maintenance and its cost, but
+--                    NOT prove PO covers the exact tables from these tables alone, so
+--                    the figure is ADDRESSABLE spend (verify PO coverage first).
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      addressable <= corrected warehouse cost (share in [0,1] of the
+--                    same cost); closed-open window; corrections applied; coverage-guarded.
+--
+-- DETECTION (measured, per warehouse, from system.query.history):
+--   * Manual maintenance = successful (execution_status='FINISHED') statements whose
+--     text begins OPTIMIZE or VACUUM, run on a SQL warehouse (query.history covers
+--     DBSQL). ZORDER is expressed as `OPTIMIZE ... ZORDER BY`, so it is captured by
+--     the OPTIMIZE prefix.
+--   * We count OPTIMIZE vs VACUUM runs, the days they ran (a recurring cadence, not a
+--     one-off), and the Spark task-time they consumed, to apportion the warehouse's
+--     corrected cost.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH all_q AS (  -- total task time across EVERY query on the warehouse (the denominator)
+  SELECT
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    SUM(COALESCE(total_task_duration_ms, 0)) AS total_task_ms
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND {{ m.window_lower('start_time') }}
+  GROUP BY 1, 2
+),
+maint AS (  -- one row per successful OPTIMIZE / VACUUM statement
+  SELECT
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    CAST(start_time AS DATE) AS day,
+    CASE WHEN UPPER(TRIM(statement_text)) LIKE 'OPTIMIZE%' THEN 1 ELSE 0 END AS is_opt,
+    CASE WHEN UPPER(TRIM(statement_text)) LIKE 'VACUUM%' THEN 1 ELSE 0 END AS is_vac,
+    COALESCE(total_task_duration_ms, 0) AS task_ms
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND execution_status = 'FINISHED'
+    AND {{ m.window_lower('start_time') }}
+    AND (UPPER(TRIM(statement_text)) LIKE 'OPTIMIZE%'
+         OR UPPER(TRIM(statement_text)) LIKE 'VACUUM%')
+),
+per_wh AS (
+  SELECT
+    workspace_id,
+    warehouse_id,
+    COUNT(*) AS maintenance_runs,
+    -- Distinct days maintenance ran: a recurring cadence (a nightly job), not one
+    -- ad-hoc OPTIMIZE. score() suppresses below min_observation_days.
+    COUNT(DISTINCT day) AS observed_days,
+    SUM(is_opt) AS optimize_runs,
+    SUM(is_vac) AS vacuum_runs,
+    SUM(task_ms) AS maintenance_task_ms
+  FROM maint
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= {{ min_maintenance_runs }}
+),
+-- Per-day OPTIMIZE / VACUUM counts, for the chart.
+daily AS (
+  SELECT workspace_id, warehouse_id, day,
+         SUM(is_opt) AS opt, SUM(is_vac) AS vac
+  FROM maint
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, warehouse_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, opt AS o, vac AS v)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'o', x.o, 'v', x.v)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+),
+-- Corrected warehouse cost, same canonical layer as every rule.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+),
+latest_warehouses AS (
+  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size
+  FROM {{ tbl('compute','warehouses') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+  ) = 1
+)
+SELECT
+  p.workspace_id,
+  p.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  p.maintenance_runs,
+  p.observed_days,
+  p.optimize_runs,
+  p.vacuum_runs,
+  p.maintenance_task_ms,
+  COALESCE(a.total_task_ms, 0) AS total_task_ms,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus,
+  da.days
+FROM per_wh p
+LEFT JOIN all_q a USING (workspace_id, warehouse_id)
+LEFT JOIN daily_arr da USING (workspace_id, warehouse_id)
+LEFT JOIN cost c USING (workspace_id, warehouse_id)
+LEFT JOIN latest_warehouses w USING (workspace_id, warehouse_id)

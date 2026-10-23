@@ -1,0 +1,101 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: serverless_cost_optimized
+-- Candidate serverless Jobs and DLT/SDP pipelines running on
+-- PERFORMANCE_OPTIMIZED that could switch to Standard (cost-optimized) mode.
+-- Standard uses ~50% fewer DBUs at the same $/DBU (net of slightly slower
+-- runtime), so the toggle is a direct saving on eligible workloads.
+--
+-- Only JOBS and DLT expose the Performance vs Standard toggle, so those are the
+-- only billing_origin_products considered. We attribute real dollars per entity
+-- (job_id or dlt_pipeline_id) and compute a median run duration so score() can
+-- discount short workloads, whose cold-start overhead makes Standard a poor fit.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py) so this same SQL serves both
+-- account-wide precompute and workspace-scoped live queries.
+WITH perf_cost AS (  -- PERFORMANCE_OPTIMIZED serverless cost per entity
+  SELECT
+    u.workspace_id,
+    u.billing_origin_product,
+    COALESCE(u.usage_metadata.job_id, u.usage_metadata.dlt_pipeline_id) AS entity_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    -- Distinct billed days on performance-optimized serverless. The DBU reduction
+    -- is extrapolated from this spend, so one day's usage would project a monthly
+    -- saving the workload may never incur. score() suppresses rows below
+    -- min_observation_days (finops_rules.history).
+    COUNT(DISTINCT u.usage_date) AS observed_days
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product IN ('JOBS', 'DLT')
+    AND u.sku_name ILIKE '%SERVERLESS%'
+    AND u.product_features.performance_target = 'PERFORMANCE_OPTIMIZED'
+    AND COALESCE(u.usage_metadata.job_id, u.usage_metadata.dlt_pipeline_id) IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+-- Median run duration (minutes) for jobs, so score() can rate suitability.
+-- Exclude runs that never executed (result_state = 'SKIPPED'): they consume no
+-- compute and no cold-start, so they say nothing about whether cost-optimized
+-- mode is a fit. A chronically-skipped/failing job can log hundreds of ~0-second
+-- skips that otherwise dominate the population and collapse the median to ~0 min,
+-- mislabelling a job whose real runs last minutes as "short". Runs that actually
+-- ran (SUCCEEDED/ERROR/FAILED/TIMED_OUT/CANCELLED/…) are kept.
+job_dur AS (
+  SELECT workspace_id, entity_id, median(run_min) AS median_min
+  FROM (
+    SELECT workspace_id, job_id AS entity_id, run_id,
+           (unix_timestamp(MAX(period_end_time)) - unix_timestamp(MIN(period_start_time))) / 60.0 AS run_min
+    FROM {{ tbl('lakeflow','job_run_timeline') }}
+    WHERE {{ m.window_lower('period_start_time') }}
+    GROUP BY 1, 2, 3
+    HAVING MAX(CASE WHEN result_state = 'SKIPPED' THEN 1 ELSE 0 END) = 0
+  )
+  GROUP BY 1, 2
+),
+-- Median update duration (minutes) for pipelines.
+pipe_dur AS (
+  SELECT workspace_id, entity_id, median(dur_min) AS median_min
+  FROM (
+    SELECT workspace_id, pipeline_id AS entity_id, update_id,
+           (unix_timestamp(MAX(period_end_time)) - unix_timestamp(MIN(period_start_time))) / 60.0 AS dur_min
+    FROM {{ tbl('lakeflow','pipeline_update_timeline') }}
+    WHERE {{ m.window_lower('period_start_time') }}
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+-- Current (non-deleted) name of every job / pipeline, via the shared macro:
+-- rank ALL versions then keep rn=1 AND delete_time IS NULL, so a since-deleted
+-- entity resolves to its id (COALESCE fallback) rather than resurrecting an older
+-- name. PORTABLE: the earlier QUALIFY was DBSQL-only and the hermetic local-Spark
+-- gate could not parse it (same migration failing_jobs / continuous_pipeline made).
+{{ m.latest_scd_cte(
+     'job_meta',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id AS entity_id, name, delete_time') }},
+{{ m.latest_scd_cte(
+     'pipe_meta',
+     tbl('lakeflow','pipelines'),
+     'workspace_id, pipeline_id',
+     select_cols='workspace_id, pipeline_id AS entity_id, name, delete_time') }}
+SELECT
+  p.workspace_id,
+  p.entity_id,
+  p.billing_origin_product,
+  CASE WHEN p.billing_origin_product = 'JOBS' THEN 'Job' ELSE 'SDP pipeline' END AS workload_type,
+  COALESCE(jm.name, pm.name, p.entity_id) AS entity_name,
+  COALESCE(jd.median_min, pd.median_min) AS median_run_min,
+  COALESCE(p.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(p.dbus_30d, 0) AS dbus_30d,
+  COALESCE(p.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(p.observed_days, 0) AS observed_days
+FROM perf_cost p
+LEFT JOIN job_dur  jd ON p.billing_origin_product = 'JOBS' AND p.workspace_id = jd.workspace_id AND p.entity_id = jd.entity_id
+LEFT JOIN pipe_dur pd ON p.billing_origin_product = 'DLT'  AND p.workspace_id = pd.workspace_id AND p.entity_id = pd.entity_id
+LEFT JOIN job_meta  jm ON p.billing_origin_product = 'JOBS' AND p.workspace_id = jm.workspace_id AND p.entity_id = jm.entity_id
+LEFT JOIN pipe_meta pm ON p.billing_origin_product = 'DLT'  AND p.workspace_id = pm.workspace_id AND p.entity_id = pm.entity_id

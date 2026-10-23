@@ -1,0 +1,110 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: ai_gateway_wasted_inference  (AI Gateway efficiency)
+--
+-- FORMULA HEADER
+--   cost basis:      NONE reliably billable per endpoint. AI-gateway / foundation-model
+--                    traffic bills per TOKEN under a model SKU that system.billing.usage
+--                    does not split cleanly by endpoint_id (a gateway endpoint's
+--                    per-endpoint serving cost comes back ~$0). So this is an OPERATIONAL
+--                    finding: it reports the FAILED requests and the input tokens they
+--                    wasted, not a booked dollar figure.
+--   units:           failed requests; input tokens consumed by requests that then failed
+--                    (a 5xx typically invokes the model and bills input before failing).
+--   counterfactual:  a serving endpoint fronted by the gateway that returns a high rate
+--                    of ERRORS (status_code >= 400) is a broken client integration — the
+--                    requests reach the gateway, often invoke the model (5xx) and burn
+--                    input tokens, and return nothing usable. Fixing the caller removes
+--                    that wasted inference. Directly avoidable work, like a repeatedly-
+--                    failing SQL query (rule A) one layer up.
+--   savings_status:  advisory ($0 booked, operational). Experimental / Labs.
+--
+-- DETECTION (measured, per serving endpoint, from system.ai_gateway.usage):
+--   * One row per inference request with its status_code and token counts. A request is
+--     FAILED when status_code >= 400; we separate 5xx (server errors — the model was
+--     usually invoked, input tokens billed) from 4xx (client errors — often rejected
+--     pre-inference) for the explanation, and count the input tokens the 5xx failures
+--     wasted.
+--   * We surface the single most-common failing status code + its count so a reader sees
+--     whether it is an auth wall (401/403), a bad request (400), rate-limiting (429), or
+--     an overloaded model (500/503).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH reqs AS (  -- one row per gateway request in the window, with day + failed flags
+  SELECT
+    workspace_id,
+    endpoint_id,
+    endpoint_name,
+    CAST(event_time AS DATE) AS day,
+    CASE WHEN status_code >= 400 THEN 1 ELSE 0 END AS failed,
+    CASE WHEN status_code >= 500 THEN 1 ELSE 0 END AS server_err,
+    COALESCE(input_tokens, 0) AS in_tokens,
+    status_code
+  FROM {{ tbl('ai_gateway','usage') }}
+  WHERE endpoint_id IS NOT NULL
+    AND status_code IS NOT NULL
+    AND {{ m.window_lower('event_time') }}
+),
+per_ep AS (
+  SELECT
+    workspace_id,
+    endpoint_id,
+    endpoint_name,
+    COUNT(*) AS requests,
+    -- Distinct days the endpoint saw traffic: a recurring pattern, not one bad hour.
+    COUNT(DISTINCT day) AS observed_days,
+    SUM(failed) AS failed_requests,
+    SUM(server_err) AS server_errors,
+    -- Input tokens billed on requests that then FAILED (wasted inference spend).
+    SUM(CASE WHEN failed = 1 THEN in_tokens ELSE 0 END) AS failed_input_tokens
+  FROM reqs
+  GROUP BY 1, 2, 3
+  HAVING SUM(failed) >= {{ min_failed_requests }}
+),
+-- The single most-common failing status code per endpoint, for the "why".
+fail_codes AS (
+  SELECT workspace_id, endpoint_id, status_code AS code, COUNT(*) AS n
+  FROM reqs
+  WHERE failed = 1
+  GROUP BY 1, 2, 3
+),
+top_fail AS (
+  SELECT workspace_id, endpoint_id, code AS top_status_code, n AS top_status_count
+  FROM fail_codes
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, endpoint_id ORDER BY n DESC
+  ) = 1
+),
+-- Per-day failed vs total requests, for the chart.
+daily AS (
+  SELECT workspace_id, endpoint_id, day,
+         COUNT(*) AS total, SUM(failed) AS failed
+  FROM reqs
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, endpoint_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, total AS t, failed AS f)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 't', x.t, 'f', x.f)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+)
+SELECT
+  p.workspace_id,
+  p.endpoint_id,
+  COALESCE(p.endpoint_name, p.endpoint_id) AS endpoint_name,
+  p.requests,
+  p.observed_days,
+  p.failed_requests,
+  p.server_errors,
+  p.failed_input_tokens,
+  ROUND(p.failed_requests / p.requests, 4) AS error_rate,
+  tf.top_status_code,
+  tf.top_status_count,
+  da.days
+FROM per_ep p
+LEFT JOIN top_fail tf USING (workspace_id, endpoint_id)
+LEFT JOIN daily_arr da USING (workspace_id, endpoint_id)

@@ -1,0 +1,74 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: delta_sharing_materialization  (Delta Sharing)
+--
+-- FORMULA HEADER
+--   cost basis:      NONE billable from these tables. A materialization recomputes /
+--                    copies a shared dataset (compute + cross-region egress), but
+--                    system.sharing.materialization_history records the EVENT, not its
+--                    cost — and egress is a cloud-provider charge outside DBUs. So this
+--                    is an OPERATIONAL finding: $0 booked, $0 addressable in DBU terms.
+--   units:           materialization events per shared table over the window.
+--   counterfactual:  a share whose tables are materialized over and over is paying to
+--                    rebuild the same data repeatedly. Materializing less often (or
+--                    sharing live instead of materialized, where the recipient allows)
+--                    removes that recompute/egress.
+--   savings_status:  advisory ($0 booked, operational). Experimental / Labs.
+--
+-- DETECTION: count materialization events per share over the window (a recurring
+-- cadence, not a one-off). We surface the distinct tables and recipients so a reader
+-- can see whether it is one hot table or a broad re-share.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH mat AS (
+  SELECT
+    workspace_id,
+    share_name,
+    provider_name,
+    schema_name,
+    table_name,
+    recipient_name,
+    CAST(created_at AS DATE) AS day
+  FROM {{ tbl('sharing','materialization_history') }}
+  WHERE share_name IS NOT NULL
+    AND {{ m.window_lower('created_at') }}
+),
+per_share AS (
+  SELECT
+    workspace_id,
+    share_name,
+    MAX(provider_name) AS provider_name,
+    COUNT(*) AS materializations,
+    COUNT(DISTINCT day) AS observed_days,
+    COUNT(DISTINCT concat_ws('.', schema_name, table_name)) AS distinct_tables,
+    COUNT(DISTINCT recipient_name) AS distinct_recipients
+  FROM mat
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= {{ min_materializations }}
+),
+daily AS (
+  SELECT workspace_id, share_name, day, COUNT(*) AS n
+  FROM mat
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, share_name,
+    transform(
+      array_sort(collect_list(struct(day AS d, n AS n)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'n', x.n)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+)
+SELECT
+  p.workspace_id,
+  p.share_name,
+  p.provider_name,
+  p.materializations,
+  p.observed_days,
+  p.distinct_tables,
+  p.distinct_recipients,
+  da.days
+FROM per_share p
+LEFT JOIN daily_arr da USING (workspace_id, share_name)

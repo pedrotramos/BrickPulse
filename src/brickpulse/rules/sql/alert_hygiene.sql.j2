@@ -1,0 +1,279 @@
+{% import '_macros.sql.j2' as m with context %}
+{% set hd = history_days | default(14) %}
+-- Rule: alert_hygiene
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate, via the canonical price_join)
+--   units:           one row per LIVE, UNPAUSED SQL alert (alert.alerts, latest SCD row)
+--                    that was evaluated in the window. Three hygiene signals:
+--                    (a) ALWAYS ERRORING — every evaluation since its last successful
+--                        one errored, for >= N distinct days (alert_evaluation_history);
+--                    (b) NOBODY NOTIFIED — no subscriptions, not driven by a user job,
+--                        and no evaluation in the window notified anyone;
+--                    (c) KEEPING A WAREHOUSE WARM — billed warehouse-hours in which the
+--                        only statements running were alert evaluations
+--                        (query.history.query_source.alert_id). Without those alert
+--                        queries the warehouse would not have been up in that hour.
+--   counterfactual:  the ADDRESSABLE figure is the alert's share of its warehouse's
+--                    alert-only billed hours (split by the alert's statement count in
+--                    each hour); score() deducts one auto-stop tail per contiguous run
+--                    of alert-only hours (billed anyway after the last real work).
+--                    (a)/(b) alone carry no warm-hours cost when the warehouse is busy
+--                    anyway — their own query time is negligible — so they surface at $0.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      alert_warm_cost <= warehouse alert-only cost <= window cost;
+--                    closed-open {{ hd }}-day window on evaluations, query.history and
+--                    billing; a non-alert statement covers EVERY hour it runs in, so a
+--                    long query spanning an hour boundary never makes the next hour look
+--                    alert-only.
+--
+-- Job wiring: every evaluation carries a job_id. The alert's OWN schedule runs as a
+-- system job with task_key 'evaluate_alert' (that job is NOT in lakeflow.jobs); an
+-- alert used as a task in a USER job carries that job's own task_key. A user job may
+-- notify on the alert result itself, so (b) never fires for a job-wired alert.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH {{ m.latest_scd_cte(
+     'al',
+     tbl('alert','alerts'),
+     'workspace_id, alert_id',
+     select_cols='workspace_id, alert_id, display_name, owned_by, run_as, compute, schedule, subscriptions, create_time, delete_time') }},
+live_alerts AS (
+  SELECT workspace_id, alert_id, display_name, owned_by, run_as,
+         compute.type AS compute_type,
+         compute.warehouse_id AS warehouse_id,
+         schedule.quartz_cron_schedule AS cron,
+         COALESCE(size(subscriptions), 0) AS subscription_count,
+         create_time
+  FROM al
+  WHERE COALESCE(schedule.pause_status, 'UNPAUSED') <> 'PAUSED'
+),
+ev_raw AS (
+  SELECT e.workspace_id, e.alert_id, e.start_time, e.task_key, e.evaluated_state,
+         e.error_code, e.error_message,
+         COALESCE(size(e.notified_subscriptions), 0) AS notified
+  FROM {{ tbl('alert','alert_evaluation_history') }} e
+  JOIN live_alerts a ON a.workspace_id = e.workspace_id AND a.alert_id = e.alert_id
+  WHERE {{ m.window_lower('e.start_time', hd) }}
+),
+last_ok AS (
+  SELECT workspace_id, alert_id, MAX(start_time) AS last_ok_time
+  FROM ev_raw WHERE error_code IS NULL
+  GROUP BY 1, 2
+),
+ev AS (
+  SELECT
+    r.workspace_id, r.alert_id,
+    COUNT(*) AS evaluations,
+    SUM(CASE WHEN r.error_code IS NOT NULL THEN 1 ELSE 0 END) AS errored_evaluations,
+    SUM(CASE WHEN r.evaluated_state = 'TRIGGERED' THEN 1 ELSE 0 END) AS triggered_evaluations,
+    SUM(CASE WHEN r.notified > 0 THEN 1 ELSE 0 END) AS notifying_evaluations,
+    SUM(CASE WHEN COALESCE(r.task_key, 'evaluate_alert') <> 'evaluate_alert' THEN 1 ELSE 0 END)
+      AS user_job_evaluations,
+    COUNT(DISTINCT CAST(r.start_time AS DATE)) AS observed_days,
+    MIN(r.start_time) AS first_evaluation,
+    MAX(r.start_time) AS last_evaluation,
+    MAX(lo.last_ok_time) AS last_ok_time,
+    -- The current error streak: evaluations after the last successful one.
+    COUNT(DISTINCT CASE WHEN lo.last_ok_time IS NULL OR r.start_time > lo.last_ok_time
+                        THEN CAST(r.start_time AS DATE) END) AS error_streak_days,
+    MAX_BY(r.error_code, r.start_time) AS last_error_code,
+    MAX_BY(substr(r.error_message, 1, 300), r.start_time) AS last_error_message,
+    MAX_BY(r.error_code IS NOT NULL, r.start_time) AS last_evaluation_errored
+  FROM ev_raw r
+  LEFT JOIN last_ok lo ON lo.workspace_id = r.workspace_id AND lo.alert_id = r.alert_id
+  GROUP BY 1, 2
+),
+alert_whs AS (  -- warehouses that ran at least one live alert's statements
+  SELECT DISTINCT workspace_id, warehouse_id FROM live_alerts WHERE warehouse_id IS NOT NULL
+),
+q AS (  -- every statement on those warehouses in the window, tagged alert / other
+  SELECT
+    qh.workspace_id,
+    qh.compute.warehouse_id AS warehouse_id,
+    qh.query_source.alert_id AS alert_id,
+    qh.start_time,
+    GREATEST(COALESCE(qh.end_time, qh.start_time), qh.start_time) AS end_time
+  FROM {{ tbl('query','history') }} qh
+  JOIN alert_whs w
+    ON w.workspace_id = qh.workspace_id AND w.warehouse_id = qh.compute.warehouse_id
+  WHERE {{ m.window_lower('qh.start_time', hd) }}
+),
+other_hours AS (  -- every hour a NON-alert statement was running in (start..end inclusive)
+  SELECT DISTINCT workspace_id, warehouse_id, h
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           explode(sequence(date_trunc('HOUR', start_time), date_trunc('HOUR', end_time),
+                            INTERVAL 1 HOUR)) AS h
+    FROM q
+    WHERE alert_id IS NULL
+  )
+),
+alert_hour_q AS (  -- alert statements per (warehouse, hour, alert)
+  SELECT workspace_id, warehouse_id, date_trunc('HOUR', start_time) AS h, alert_id,
+         COUNT(*) AS n
+  FROM q
+  WHERE alert_id IS NOT NULL
+  GROUP BY 1, 2, 3, 4
+),
+billed_hours AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    date_trunc('HOUR', u.usage_start_time) AS h,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  JOIN alert_whs w
+    ON w.workspace_id = u.workspace_id AND w.warehouse_id = u.usage_metadata.warehouse_id
+  WHERE {{ m.window_lower('u.usage_date', hd) }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+alert_only_hours AS (  -- billed hours with alert statements and nothing else running
+  SELECT b.workspace_id, b.warehouse_id, b.h, b.cost_usd, b.dbus, b.unpriced,
+         SUM(aq.n) AS alert_statements
+  FROM billed_hours b
+  JOIN alert_hour_q aq
+    ON aq.workspace_id = b.workspace_id AND aq.warehouse_id = b.warehouse_id AND aq.h = b.h
+  LEFT JOIN other_hours o
+    ON o.workspace_id = b.workspace_id AND o.warehouse_id = b.warehouse_id AND o.h = b.h
+  WHERE o.h IS NULL
+  GROUP BY 1, 2, 3, 4, 5, 6
+),
+wh_islands AS (  -- contiguous runs of alert-only hours per warehouse
+  SELECT workspace_id, warehouse_id,
+         COUNT(*) AS wh_alert_only_hours,
+         SUM(cost_usd) AS wh_alert_only_cost_usd,
+         SUM(CASE WHEN prev_h IS NULL OR prev_h <> h - INTERVAL 1 HOUR THEN 1 ELSE 0 END)
+           AS wh_alert_only_islands
+  FROM (
+    SELECT *, LAG(h) OVER (PARTITION BY workspace_id, warehouse_id ORDER BY h) AS prev_h
+    FROM alert_only_hours
+  )
+  GROUP BY 1, 2
+),
+wh_totals AS (
+  SELECT workspace_id, warehouse_id,
+         SUM(cost_usd) AS wh_cost_window_usd,
+         SUM(dbus) AS wh_dbus,
+         SUM(unpriced) AS unpriced_dbus,
+         COUNT(*) AS wh_billed_hours
+  FROM billed_hours
+  GROUP BY 1, 2
+),
+alert_warm_day AS (  -- each alert's share of its warehouse's alert-only hours, per day
+  SELECT aq.workspace_id, aq.alert_id, aq.warehouse_id, CAST(ao.h AS DATE) AS day,
+         COUNT(*) AS hours,
+         SUM(ao.cost_usd * aq.n / ao.alert_statements) AS cost_usd
+  FROM alert_only_hours ao
+  JOIN alert_hour_q aq
+    ON aq.workspace_id = ao.workspace_id AND aq.warehouse_id = ao.warehouse_id AND aq.h = ao.h
+  GROUP BY 1, 2, 3, 4
+),
+alert_warm AS (
+  SELECT workspace_id, alert_id, warehouse_id,
+         SUM(hours) AS warm_hours,
+         COUNT(*) AS warm_days,
+         SUM(cost_usd) AS warm_cost_usd,
+         -- per-day hours the alert alone held the warehouse up, for the chart
+         transform(
+           array_sort(collect_list(struct(day AS d, hours AS h)),
+                      (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+           x -> named_struct('d', CAST(x.d AS STRING), 'h', x.h)
+         ) AS warm_by_day
+  FROM alert_warm_day
+  GROUP BY 1, 2, 3
+),
+ev_day AS (  -- per-day evaluation outcomes, for the chart
+  SELECT workspace_id, alert_id,
+         transform(
+           array_sort(collect_list(struct(day AS d, ok, trig, err)),
+                      (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+           x -> named_struct('d', CAST(x.d AS STRING), 'ok', x.ok, 't', x.trig, 'e', x.err)
+         ) AS eval_by_day
+  FROM (
+    SELECT workspace_id, alert_id, CAST(start_time AS DATE) AS day,
+           SUM(CASE WHEN error_code IS NULL AND COALESCE(evaluated_state, '') <> 'TRIGGERED'
+                    THEN 1 ELSE 0 END) AS ok,
+           SUM(CASE WHEN error_code IS NULL AND evaluated_state = 'TRIGGERED'
+                    THEN 1 ELSE 0 END) AS trig,
+           SUM(CASE WHEN error_code IS NOT NULL THEN 1 ELSE 0 END) AS err
+    FROM ev_raw
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+alert_stmts AS (
+  SELECT workspace_id, alert_id, SUM(n) AS alert_statements,
+         COUNT(DISTINCT h) AS alert_statement_hours
+  FROM alert_hour_q
+  GROUP BY 1, 2
+),
+wh AS (
+  SELECT * FROM (
+    SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size,
+           auto_stop_minutes,
+           ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC) AS rn
+    FROM {{ tbl('compute','warehouses') }}
+  )
+  WHERE rn = 1
+)
+SELECT
+  a.workspace_id,
+  a.alert_id,
+  a.display_name,
+  a.owned_by,
+  a.run_as,
+  a.compute_type,
+  a.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  w.auto_stop_minutes,
+  a.cron,
+  a.subscription_count,
+  a.create_time,
+  e.evaluations,
+  e.errored_evaluations,
+  e.triggered_evaluations,
+  e.notifying_evaluations,
+  e.user_job_evaluations,
+  e.observed_days,
+  e.first_evaluation,
+  e.last_evaluation,
+  e.last_ok_time,
+  e.error_streak_days,
+  e.last_error_code,
+  e.last_error_message,
+  e.last_evaluation_errored,
+  COALESCE(st.alert_statements, 0) AS alert_statements,
+  COALESCE(st.alert_statement_hours, 0) AS alert_statement_hours,
+  COALESCE(aw.warm_hours, 0) AS warm_hours,
+  COALESCE(aw.warm_days, 0) AS warm_days,
+  COALESCE(aw.warm_cost_usd, 0) AS warm_cost_usd,
+  aw.warm_by_day,
+  ed.eval_by_day,
+  COALESCE(wi.wh_alert_only_hours, 0) AS wh_alert_only_hours,
+  COALESCE(wi.wh_alert_only_cost_usd, 0) AS wh_alert_only_cost_usd,
+  COALESCE(wi.wh_alert_only_islands, 0) AS wh_alert_only_islands,
+  COALESCE(wt.wh_cost_window_usd, 0) AS wh_cost_window_usd,
+  COALESCE(wt.wh_billed_hours, 0) AS wh_billed_hours,
+  COALESCE(wt.wh_dbus, 0) AS dbus_30d,
+  COALESCE(wt.unpriced_dbus, 0) AS unpriced_dbus
+FROM live_alerts a
+JOIN ev e ON e.workspace_id = a.workspace_id AND e.alert_id = a.alert_id
+LEFT JOIN wh w ON w.workspace_id = a.workspace_id AND w.warehouse_id = a.warehouse_id
+LEFT JOIN alert_stmts st ON st.workspace_id = a.workspace_id AND st.alert_id = a.alert_id
+LEFT JOIN alert_warm aw
+  ON aw.workspace_id = a.workspace_id AND aw.alert_id = a.alert_id AND aw.warehouse_id = a.warehouse_id
+LEFT JOIN ev_day ed ON ed.workspace_id = a.workspace_id AND ed.alert_id = a.alert_id
+LEFT JOIN wh_islands wi ON wi.workspace_id = a.workspace_id AND wi.warehouse_id = a.warehouse_id
+LEFT JOIN wh_totals wt ON wt.workspace_id = a.workspace_id AND wt.warehouse_id = a.warehouse_id
+WHERE
+  -- Only rows that could be a finding: erroring streak, no-one-notified, or warm hours.
+  (e.error_streak_days >= {{ min_error_streak_days }} AND e.last_evaluation_errored)
+  OR (a.subscription_count = 0 AND e.user_job_evaluations = 0 AND e.notifying_evaluations = 0)
+  OR COALESCE(aw.warm_hours, 0) >= {{ min_warm_hours }}

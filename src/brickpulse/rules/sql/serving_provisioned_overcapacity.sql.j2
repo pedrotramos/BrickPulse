@@ -1,0 +1,198 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: serving_provisioned_overcapacity  (Tier 1, B5)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the endpoint's
+--                    PROVISIONED_THROUGHPUT serving usage), priced per billed HOUR.
+--   units:           billed PT hours (billing.usage rows are hourly) x requests per
+--                    hour from system.serving.endpoint_usage.
+--   counterfactual:  provisioned throughput bills its reserved capacity every hour
+--                    whether or not a request arrives. Long stretches of billed
+--                    hours with ZERO requests are capacity a lower floor /
+--                    scale-to-zero would not have paid for. Only idle RUNS of at
+--                    least {{ min_idle_run_hours }} consecutive billed hours count
+--                    (PT scale-down and cold start take minutes, so a lone quiet
+--                    hour between busy ones is not reclaimable).
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      reclaimable_cost_usd <= cost_30d_usd (a subset of the same
+--                    priced hours); closed-open window; coverage-guarded.
+--
+-- WHAT THIS CANNOT MEASURE (verified live 2026-09-23):
+--   * The provisioned CAPACITY. Every PT endpoint billing in the window had
+--     foundation_model_config = NULL — current PT endpoints are sized in
+--     "model units", which served_entities does not carry. The legacy
+--     min/max_provisioned_throughput (tokens/sec bands) only appear on old,
+--     mostly-deleted Llama configs. So "p99 throughput << floor" is NOT computable;
+--     this rule prices only the hours with no traffic at all.
+--   * Pay-per-token counterfactual. Pay-per-token and PT bill the SAME DBU SKU
+--     (…_SERVERLESS_REAL_TIME_INFERENCE_<REGION>); the per-model DBU-per-token rate
+--     is not in list_prices or any system table, so "PT costs more than
+--     pay-per-token at this volume" cannot be priced honestly.
+--   * Request logging coverage. endpoint_usage is populated only when usage
+--     tracking is on; 31 of 45 PT endpoints had ZERO logged requests. An endpoint
+--     with no logged requests is therefore UNKNOWN here (and is the zero-traffic
+--     case idle_serving_endpoints owns), so score() requires requests > 0, and
+--     hours BEFORE the first logged request are not counted as idle (logging may
+--     have been switched on mid-window).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH
+{{ m.latest_scd_cte(
+     'latest_entities', tbl('serving','served_entities'),
+     'workspace_id, endpoint_id',
+     select_cols='workspace_id, endpoint_id, endpoint_name, entity_type, '
+                 'entity_name, created_by, endpoint_delete_time',
+     delete_col='endpoint_delete_time') }},
+-- Every served_entity_id the endpoint ever had, so requests logged against an older
+-- config version still count as traffic (same reasoning as idle_serving_endpoints).
+entity_versions AS (
+  SELECT DISTINCT workspace_id, endpoint_id, served_entity_id
+  FROM {{ tbl('serving','served_entities') }}
+),
+-- Priced PT usage per endpoint per billed hour.
+pt_hours AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.endpoint_id AS endpoint_id,
+    date_trunc('HOUR', u.usage_start_time) AS h,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'MODEL_SERVING'
+    AND u.product_features.model_serving.offering_type = 'PROVISIONED_THROUGHPUT'
+    AND u.usage_metadata.endpoint_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+-- Logged requests + tokens per endpoint per hour, across all config versions.
+req_hours AS (
+  SELECT
+    ev.workspace_id,
+    ev.endpoint_id,
+    date_trunc('HOUR', r.request_time) AS h,
+    COUNT(*) AS requests,
+    SUM(COALESCE(r.input_token_count, 0) + COALESCE(r.output_token_count, 0)) AS tokens
+  FROM {{ tbl('serving','endpoint_usage') }} r
+  JOIN entity_versions ev ON ev.served_entity_id = r.served_entity_id
+  WHERE {{ m.window_lower('r.request_time') }}
+  GROUP BY 1, 2, 3
+),
+first_req AS (
+  SELECT workspace_id, endpoint_id, MIN(h) AS first_req_h
+  FROM req_hours
+  GROUP BY 1, 2
+),
+-- One row per billed PT hour, flagged idle (no logged request that hour) — but only
+-- once request logging is proven on (at/after the first logged request).
+grid AS (
+  SELECT
+    p.workspace_id, p.endpoint_id, p.h, p.cost_usd, p.dbus, p.unpriced,
+    COALESCE(q.requests, 0) AS requests,
+    COALESCE(q.tokens, 0) AS tokens,
+    CASE WHEN q.requests IS NULL AND f.first_req_h IS NOT NULL AND p.h >= f.first_req_h
+         THEN 1 ELSE 0 END AS idle
+  FROM pt_hours p
+  LEFT JOIN req_hours q
+    ON q.workspace_id = p.workspace_id AND q.endpoint_id = p.endpoint_id AND q.h = p.h
+  LEFT JOIN first_req f
+    ON f.workspace_id = p.workspace_id AND f.endpoint_id = p.endpoint_id
+),
+-- Gaps-and-islands over billed hours: consecutive idle hours share a run key
+-- (hour index minus row number within the idle partition). A billing gap breaks
+-- the run because the hour index jumps.
+idle_runs AS (
+  SELECT workspace_id, endpoint_id, run_key,
+         COUNT(*) AS run_hours, SUM(cost_usd) AS run_cost_usd
+  FROM (
+    SELECT workspace_id, endpoint_id, cost_usd,
+           CAST(unix_timestamp(h) / 3600 AS BIGINT)
+             - ROW_NUMBER() OVER (PARTITION BY workspace_id, endpoint_id ORDER BY h) AS run_key
+    FROM grid
+    WHERE idle = 1
+  )
+  GROUP BY 1, 2, 3
+),
+runs AS (
+  SELECT
+    workspace_id, endpoint_id,
+    SUM(CASE WHEN run_hours >= {{ min_idle_run_hours }} THEN run_hours ELSE 0 END)
+      AS reclaimable_idle_hours,
+    SUM(CASE WHEN run_hours >= {{ min_idle_run_hours }} THEN run_cost_usd ELSE 0 END)
+      AS reclaimable_cost_usd,
+    MAX(run_hours) AS longest_idle_run_hours
+  FROM idle_runs
+  GROUP BY 1, 2
+),
+per_ep AS (
+  SELECT
+    workspace_id, endpoint_id,
+    COUNT(*) AS billed_hours,
+    SUM(CASE WHEN requests > 0 THEN 1 ELSE 0 END) AS active_hours,
+    SUM(idle) AS idle_hours,
+    COUNT(DISTINCT CAST(h AS DATE)) AS days_billed,
+    SUM(cost_usd) AS cost_30d_usd,
+    SUM(dbus) AS dbus_30d,
+    SUM(unpriced) AS unpriced_dbus,
+    SUM(requests) AS requests_billed_hours,
+    SUM(tokens) AS tokens_window,
+    MAX(tokens) AS peak_hour_tokens
+  FROM grid
+  GROUP BY 1, 2
+),
+-- Per-day billed-vs-requests series for the serving_traffic chart.
+daily AS (
+  SELECT
+    workspace_id, endpoint_id,
+    ARRAY_SORT(COLLECT_LIST(STRUCT(CAST(d AS STRING) AS d, 1 AS w, r))) AS days_series
+  FROM (
+    SELECT workspace_id, endpoint_id, CAST(h AS DATE) AS d, SUM(requests) AS r
+    FROM grid
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+req_totals AS (
+  SELECT workspace_id, endpoint_id,
+         SUM(requests) AS requests_window,
+         MAX(h) AS last_request_hour
+  FROM req_hours
+  GROUP BY 1, 2
+)
+SELECT
+  e.workspace_id,
+  e.endpoint_id,
+  e.endpoint_name,
+  e.entity_type,
+  e.entity_name,
+  e.created_by,
+  p.billed_hours,
+  p.active_hours,
+  p.idle_hours,
+  p.days_billed,
+  -- History guard sample: distinct days the reserved capacity actually billed.
+  p.days_billed AS observed_days,
+  p.cost_30d_usd,
+  p.dbus_30d,
+  p.unpriced_dbus,
+  COALESCE(rn.reclaimable_idle_hours, 0) AS reclaimable_idle_hours,
+  COALESCE(rn.reclaimable_cost_usd, 0) AS reclaimable_cost_usd,
+  COALESCE(rn.longest_idle_run_hours, 0) AS longest_idle_run_hours,
+  COALESCE(rt.requests_window, 0) AS requests_window,
+  rt.last_request_hour,
+  p.tokens_window,
+  p.peak_hour_tokens,
+  -- Proof the entity dimension matched (INNER JOIN below), so score() can tell
+  -- "measured no traffic" from "no request data joined".
+  1 AS entity_matched,
+  COALESCE(d.days_series, ARRAY()) AS days_series
+FROM latest_entities e
+JOIN per_ep p
+  ON p.workspace_id = e.workspace_id AND p.endpoint_id = e.endpoint_id
+LEFT JOIN runs rn
+  ON rn.workspace_id = e.workspace_id AND rn.endpoint_id = e.endpoint_id
+LEFT JOIN req_totals rt
+  ON rt.workspace_id = e.workspace_id AND rt.endpoint_id = e.endpoint_id
+LEFT JOIN daily d
+  ON d.workspace_id = e.workspace_id AND d.endpoint_id = e.endpoint_id

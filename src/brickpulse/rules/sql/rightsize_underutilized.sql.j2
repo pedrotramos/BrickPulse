@@ -1,0 +1,143 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: rightsize_underutilized
+-- Candidate all-purpose (UI) clusters that still exist (delete_time IS NULL) with
+-- room to shrink (worker_count >= 2) whose average CPU sits well below its headroom
+-- threshold over the lookback window -- i.e. oversized. CPU is the primary signal;
+-- memory only vetoes when high enough to be memory-bound (mem_bound_pct), because a
+-- CPU-idle JVM cluster holds heap resident and would otherwise be hidden. Joined to
+-- recent billed cost (usage x list_prices => real USD) so score() can estimate a
+-- conservative right-size saving.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py) so this same SQL serves both
+-- account-wide precompute and workspace-scoped live queries.
+WITH latest_clusters AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    cluster_name,
+    cluster_source,
+    worker_node_type,
+    delete_time,
+    worker_count
+  FROM {{ tbl('compute','clusters') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+  ) = 1
+),
+candidates AS (
+  SELECT *
+  FROM latest_clusters
+  -- Interactive all-purpose clusters, whether created in the UI or via
+  -- API/Terraform/DAB (cluster_source='API'). We exclude only ephemeral,
+  -- platform-managed sources (JOB, PIPELINE, MODELS, SQL, ...) which should
+  -- never be flagged for idle/rightsize/autoterm.
+  WHERE cluster_source IN ('UI', 'API')
+    AND delete_time IS NULL  -- cluster still exists
+),
+util AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    AVG(cpu_user_percent + cpu_system_percent) AS avg_cpu,
+    AVG(mem_used_percent) AS avg_mem,
+    COUNT(*) AS total_windows,
+    -- Distinct calendar days the cluster was seen running. Sizing decisions need a
+    -- representative sample of the workload's peaks, which one day cannot provide,
+    -- so score() suppresses below min_observation_days (finops_rules.history).
+    COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+  GROUP BY 1, 2
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'cluster_id') }},
+-- Hourly RESOURCE series across the window so score() can chart utilization vs
+-- paid-for headroom (plus the p95 peak marker) AND show the other resources that
+-- decide whether downsizing is safe: a CPU-idle cluster running hot on memory or
+-- blocked on I/O must not be shrunk. All metrics are index-aligned with cpu_ts.
+-- (node_timeline has no disk read/write rate, only free space per mount point, so
+-- CPU I/O wait stands in for storage pressure.)
+cpu_series AS (
+  SELECT workspace_id, cluster_id,
+         transform(sorted, x -> x.cpu) AS cpu_hourly,
+         transform(sorted, x -> x.ts) AS cpu_ts,
+         transform(sorted, x -> x.idle) AS idle_frac,
+         transform(sorted, x -> x.peak) AS cpu_peak,
+         transform(sorted, x -> x.mem) AS mem_hourly,
+         transform(sorted, x -> x.swap) AS swap_hourly,
+         transform(sorted, x -> x.iowait) AS iowait_hourly,
+         transform(sorted, x -> x.net) AS net_hourly,
+         p95_cpu,
+         p95_mem,
+         peak_mem_pct
+  FROM (
+    SELECT workspace_id, cluster_id,
+           array_sort(
+             collect_list(struct(h AS h, cpu AS cpu, unix_timestamp(h) AS ts, idle AS idle,
+                                 peak AS peak, mem AS mem, swap AS swap,
+                                 iowait AS iowait, net AS net)),
+             (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END
+           ) AS sorted,
+           percentile_approx(cpu, 0.95) AS p95_cpu,
+           -- p95 memory matters for right-sizing: the peak the smaller node must
+           -- still absorb. Reported so score()/the UI can justify the target size.
+           percentile_approx(mem, 0.95) AS p95_mem,
+           MAX(mem) * 100.0 AS peak_mem_pct
+    FROM (
+      SELECT workspace_id, cluster_id, date_trunc('HOUR', start_time) AS h,
+             AVG(cpu_user_percent + cpu_system_percent) / 100.0 AS cpu,
+             AVG(CASE WHEN cpu_user_percent + cpu_system_percent < 10 THEN 1.0 ELSE 0.0 END) AS idle,
+             MAX(cpu_user_percent + cpu_system_percent) / 100.0 AS peak,
+             AVG(mem_used_percent) / 100.0 AS mem,
+             AVG(COALESCE(mem_swap_percent, 0)) / 100.0 AS swap,
+             AVG(COALESCE(cpu_wait_percent, 0)) / 100.0 AS iowait,
+             AVG(COALESCE(network_received_bytes, 0) + COALESCE(network_sent_bytes, 0)) AS net
+      FROM {{ tbl('compute','node_timeline') }}
+      WHERE {{ m.window_lower('start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  )
+)
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  -- Cluster kind + node type, so the detail page leads with WHAT this is.
+  c.cluster_source,
+  c.worker_node_type AS node_type_id,
+  c.worker_count AS worker_count,
+  util.avg_cpu AS avg_cpu,
+  util.avg_mem AS avg_mem,
+  util.observed_days AS observed_days,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,{{ m.contract_cost_select('cost') }}{{ m.cloud_cost_select() }}
+  cpu_series.cpu_hourly,
+  cpu_series.cpu_ts,
+  cpu_series.idle_frac,
+  cpu_series.cpu_peak,
+  cpu_series.mem_hourly,
+  cpu_series.swap_hourly,
+  cpu_series.iowait_hourly,
+  cpu_series.net_hourly,
+  cpu_series.p95_cpu,
+  cpu_series.p95_mem,
+  cpu_series.peak_mem_pct
+FROM candidates c
+JOIN util USING (workspace_id, cluster_id)
+LEFT JOIN cost USING (workspace_id, cluster_id){{ m.cloud_cost_join('cloud_cost', 'c', 'cluster_id') }}
+LEFT JOIN cpu_series USING (workspace_id, cluster_id)
+WHERE util.total_windows > 0
+  AND util.avg_cpu < {{ cpu_headroom_pct }}
+  -- Memory is a one-way veto: only exclude clusters high enough to be memory-bound.
+  AND util.avg_mem < {{ mem_bound_pct }}
+  AND c.worker_count >= 2  -- room to shrink

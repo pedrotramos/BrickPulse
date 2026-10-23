@@ -1,0 +1,79 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: gpu_wrong_runtime
+-- Clusters provisioned on a GPU node type whose runtime CANNOT use the GPU.
+--
+-- METHODOLOGY (pure configuration — no utilization proxy needed):
+--   Databricks only drives the GPU on a GPU-enabled ML runtime (the '-gpu-ml'
+--   Databricks Runtime, e.g. '16.4.x-gpu-ml-scala2.13'). A GPU instance running
+--   any OTHER runtime — a standard runtime ('15.4.x-scala2.12'), a CPU-ML runtime,
+--   or Photon — bills the GPU hardware but physically cannot use it, so the whole
+--   GPU premium is wasted and the workload belongs on a comparable CPU instance.
+--   A node type is GPU iff system.compute.node_types.gpu_count > 0.
+--
+--   WHY NOT node_timeline utilization: system.compute.node_timeline has NO GPU
+--   utilization column (verified: only CPU/memory/network/disk), and CPU% is a
+--   trap on GPU boxes — a GPU-bound job legitimately shows near-zero CPU. So
+--   "idle GPU" is NOT measurable; this rule instead catches the case where the
+--   GPU is unusable BY CONSTRUCTION, from config alone. High detection confidence.
+--
+--   COST is the real billed Databricks DBU spend on the cluster (usage x
+--   list_prices). It is a FLOOR on the waste, not the whole story: GPU and
+--   CPU compute bill under the SAME sku (ENTERPRISE_ALL_PURPOSE_COMPUTE) so there is
+--   no GPU DBU line to isolate, and the DOMINANT GPU cost — the cloud VM/GPU
+--   instance price — is on the customer's cloud bill, not in system tables. score()
+--   therefore books $0 and ranks on this at-risk spend (see the Python docstring).
+--
+--   SCOPE: persistent all-purpose clusters (cluster_source IN ('UI','API')).
+--   Ephemeral JOB clusters churn a fresh cluster_id per run, which would fragment
+--   the cost and the finding across hundreds of ids, so they are excluded here.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH
+-- Current cluster config (rank ALL versions, then keep the live latest).
+{{ m.latest_scd_cte(
+     'latest_clusters', tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, cluster_source, '
+                 'driver_node_type, worker_node_type, worker_count, dbr_version, '
+                 'delete_time',
+     where="cluster_source IN ('UI', 'API')") }},
+node_types AS (  -- dedupe node-type specs (the table can have per-account/region rows)
+  SELECT node_type,
+         MAX(core_count) AS core_count,
+         MAX(memory_mb) AS memory_mb,
+         MAX(gpu_count) AS gpu_count
+  FROM {{ tbl('compute','node_types') }}
+  GROUP BY node_type
+),
+-- real billed cost per cluster over the window, priced via list_prices.
+-- Emits cost_30d_usd, dbus_30d, unpriced_dbus, observed_days.
+{{ m.usage_cost_cte('cost', 'u.usage_metadata.cluster_id', 'cluster_id') }}
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  c.cluster_source,
+  c.dbr_version,
+  c.worker_node_type,
+  c.driver_node_type,
+  c.worker_count,
+  COALESCE(wnt.gpu_count, 0) AS worker_gpu_count,
+  COALESCE(dnt.gpu_count, 0) AS driver_gpu_count,
+  wnt.core_count AS worker_cores,
+  wnt.memory_mb AS worker_memory_mb,
+  dnt.core_count AS driver_cores,
+  dnt.memory_mb AS driver_memory_mb,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(cost.observed_days, 0) AS observed_days{{ m.contract_cost_select('cost', lead=True) }}
+FROM latest_clusters c
+LEFT JOIN node_types wnt ON c.worker_node_type = wnt.node_type
+LEFT JOIN node_types dnt ON c.driver_node_type = dnt.node_type
+-- INNER JOIN: a cluster with no priced billed usage in the window has nothing at risk.
+JOIN cost ON cost.workspace_id = c.workspace_id AND cost.cluster_id = c.cluster_id
+-- A GPU node type (driver or worker) running a non-'-gpu-ml' runtime => GPU unusable.
+WHERE (COALESCE(wnt.gpu_count, 0) > 0 OR COALESCE(dnt.gpu_count, 0) > 0)
+  AND c.dbr_version IS NOT NULL
+  AND lower(c.dbr_version) NOT LIKE '%-gpu-ml%'
+  AND COALESCE(cost.cost_30d_usd, 0) > 0

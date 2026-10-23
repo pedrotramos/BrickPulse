@@ -1,0 +1,185 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: cluster_job_contention
+-- Multiple job runs executing AT THE SAME TIME on one all-purpose (interactive)
+-- cluster, saturating it — the jobs compete for the same fixed pool of cores /
+-- memory, so each runs slower than it would in isolation. The lever is NOT a
+-- bigger shared cluster (that just raises the all-purpose bill); it is to ISOLATE
+-- the jobs onto their own job clusters, which are cheaper per DBU AND remove the
+-- contention. This dovetails with interactive_to_job (same clusters, same fix)
+-- but is judged on a DIFFERENT, measured signal: node saturation during overlap.
+--
+-- METHODOLOGY (per-CLUSTER, measured):
+--   1. Concurrency — from job_task_run_timeline, per (cluster, minute) count the
+--      DISTINCT job runs active at once. A minute with >= 2 is "contended".
+--   2. Saturation — from node_timeline, the SAME minute's cluster-wide average
+--      CPU (user+system) and memory. node_timeline is NODE-level, never per-job,
+--      so this measures "the box was saturated while N jobs overlapped", never
+--      "job A starved job B" — we surface a contention SIGNAL, not per-job blame.
+--   3. The discriminator is the SOLO-vs-CONCURRENT DELTA. A cluster saturated
+--      equally whether one job or several run is simply UNDERSIZED (rightsize's
+--      problem), not contended. Contention shows as saturation that RISES with
+--      concurrency: high p95 during overlap AND materially above the solo level.
+--
+-- COVERAGE GATE: only minutes with node_timeline telemetry can prove saturation.
+-- A cluster whose job-timeline shows overlap but has no node samples (e.g. a
+-- cluster deleted before telemetry landed) is EXCLUDED — we never claim
+-- contention we cannot measure. scoring gates on the measured fraction.
+--
+-- DOLLARS: this rule claims $0 savings. The all-purpose->job-compute price gap on
+-- these same clusters is already owned by interactive_to_job; counting it again
+-- would double-book. The payoff here is performance/reliability, so we rank on
+-- monthly_waste_usd = the all-purpose spend AT RISK during contended minutes
+-- (spend that is buying degraded, self-competing throughput), savings = 0. Same
+-- contract as untagged_spend.
+--
+-- IMPORTANT: no workspace_id filter here — persona scoping is injected later.
+WITH all_purpose_clusters AS (
+  SELECT workspace_id, cluster_id
+  FROM (
+    SELECT workspace_id, cluster_id, cluster_source,
+           ROW_NUMBER() OVER (
+             PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','clusters') }}
+  )
+  WHERE rn = 1 AND cluster_source IN ('UI', 'API')
+),
+latest_clusters AS (
+  SELECT workspace_id, cluster_id, cluster_name
+  FROM {{ tbl('compute','clusters') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+  ) = 1
+),
+-- All-purpose cost of each cluster over the window (priced at each usage row's
+-- OWN sku via the shared, region-correct macro join). This is the pool the
+-- contended-minute spend-at-risk is attributed from.
+ap_usage AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('ap_lp') }}) AS ap_cost,
+    SUM({{ m.unpriced_dbus('u', 'ap_lp') }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('ap_lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'ALL_PURPOSE'
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Minutes the cluster was billed (running), and distinct days observed — the
+-- denominator for spend attribution and the history guard's observed_days.
+cluster_running_min AS (
+  SELECT workspace_id, cluster_id,
+         COUNT(*) AS running_minutes,
+         COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+    AND cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Per (cluster, minute) x job run: one row per minute each job run was live.
+job_minute AS (
+  SELECT t.workspace_id,
+         explode(t.compute_ids) AS cluster_id,
+         t.job_id, t.run_id,
+         explode(sequence(
+           unix_timestamp(date_trunc('MINUTE', t.period_start_time)) DIV 60,
+           unix_timestamp(date_trunc('MINUTE', t.period_end_time)) DIV 60
+         )) AS tm
+  FROM {{ tbl('lakeflow','job_task_run_timeline') }} t
+  WHERE {{ m.window_lower('t.period_start_time') }}
+    AND size(t.compute_ids) > 0
+),
+-- Per (cluster, minute): how many distinct job RUNS overlapped.
+job_conc AS (
+  SELECT workspace_id, cluster_id, tm,
+         COUNT(DISTINCT run_id) AS concurrent_runs
+  FROM job_minute
+  GROUP BY 1, 2, 3
+),
+-- Per (cluster, minute): cluster-wide saturation, averaged across the nodes.
+node_sat AS (
+  SELECT workspace_id, cluster_id,
+         unix_timestamp(date_trunc('MINUTE', start_time)) DIV 60 AS tm,
+         AVG(cpu_user_percent + cpu_system_percent) AS cpu_pct,
+         AVG(mem_used_percent) AS mem_pct
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+    AND cluster_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+-- One row per job-active minute, tagged concurrent/solo and with (nullable)
+-- saturation. LEFT JOIN so a minute with no telemetry is kept but flagged
+-- unmeasured — the coverage gate downstream decides whether to trust the cluster.
+minute_stats AS (
+  SELECT c.workspace_id, c.cluster_id, c.tm, c.concurrent_runs,
+         s.cpu_pct, s.mem_pct,
+         (s.cpu_pct IS NOT NULL) AS measured,
+         (c.concurrent_runs >= 2) AS contended
+  FROM job_conc c
+  JOIN all_purpose_clusters ap USING (workspace_id, cluster_id)
+  LEFT JOIN node_sat s USING (workspace_id, cluster_id, tm)
+),
+-- Distinct jobs that ever participated in a contended (>=2 concurrent) minute.
+contended_jobs AS (
+  SELECT jm.workspace_id, jm.cluster_id,
+         COUNT(DISTINCT jm.job_id) AS contended_job_count
+  FROM job_minute jm
+  JOIN job_conc jc USING (workspace_id, cluster_id, tm)
+  WHERE jc.concurrent_runs >= 2
+  GROUP BY 1, 2
+),
+cluster_contention AS (
+  SELECT
+    workspace_id, cluster_id,
+    COUNT(*) AS job_active_minutes,
+    MAX(concurrent_runs) AS peak_concurrent_runs,
+    ROUND(AVG(concurrent_runs), 2) AS avg_concurrent_runs,
+    SUM(CASE WHEN contended THEN 1 ELSE 0 END) AS contended_minutes,
+    SUM(CASE WHEN contended AND measured THEN 1 ELSE 0 END) AS contended_minutes_measured,
+    -- Saturation during overlap vs when running solo — the delta is the signal.
+    ROUND(AVG(CASE WHEN contended AND measured THEN cpu_pct END), 1) AS cpu_pct_concurrent,
+    ROUND(AVG(CASE WHEN NOT contended AND measured THEN cpu_pct END), 1) AS cpu_pct_solo,
+    ROUND(PERCENTILE(CASE WHEN contended AND measured THEN cpu_pct END, 0.95), 1) AS cpu_pct_concurrent_p95,
+    ROUND(AVG(CASE WHEN contended AND measured THEN mem_pct END), 1) AS mem_pct_concurrent,
+    ROUND(AVG(CASE WHEN NOT contended AND measured THEN mem_pct END), 1) AS mem_pct_solo,
+    ROUND(PERCENTILE(CASE WHEN contended AND measured THEN mem_pct END, 0.95), 1) AS mem_pct_concurrent_p95
+  FROM minute_stats
+  GROUP BY 1, 2
+)
+SELECT
+  cc.workspace_id,
+  cc.cluster_id,
+  lc.cluster_name,
+  cc.job_active_minutes,
+  cc.peak_concurrent_runs,
+  cc.avg_concurrent_runs,
+  cc.contended_minutes,
+  cc.contended_minutes_measured,
+  -- Fraction of contended minutes we could actually measure (coverage gate).
+  ROUND(cc.contended_minutes_measured / NULLIF(cc.contended_minutes, 0), 4) AS contended_measured_frac,
+  cc.cpu_pct_concurrent,
+  cc.cpu_pct_solo,
+  cc.cpu_pct_concurrent_p95,
+  cc.mem_pct_concurrent,
+  cc.mem_pct_solo,
+  cc.mem_pct_concurrent_p95,
+  COALESCE(cj.contended_job_count, 0) AS contended_job_count,
+  COALESCE(crm.running_minutes, 0) AS running_minutes,
+  COALESCE(crm.observed_days, 0) AS observed_days,
+  ROUND(ap.ap_cost, 2) AS cost_30d_usd,
+  ap.unpriced_dbus,
+  -- Spend AT RISK: the all-purpose cost attributed to contended minutes (spend
+  -- buying self-competing throughput). Ranking figure, NOT a saving.
+  ROUND(ap.ap_cost * cc.contended_minutes / NULLIF(crm.running_minutes, 0), 2) AS contended_cost_30d_usd
+FROM cluster_contention cc
+JOIN all_purpose_clusters ac USING (workspace_id, cluster_id)
+JOIN ap_usage ap USING (workspace_id, cluster_id)
+LEFT JOIN cluster_running_min crm USING (workspace_id, cluster_id)
+LEFT JOIN contended_jobs cj USING (workspace_id, cluster_id)
+LEFT JOIN latest_clusters lc USING (workspace_id, cluster_id)
+-- Must have real overlap AND at least some measured contended minutes; the finer
+-- coverage / delta / saturation gates live in score() so they stay tunable.
+WHERE cc.peak_concurrent_runs >= 2
+  AND cc.contended_minutes_measured >= 1

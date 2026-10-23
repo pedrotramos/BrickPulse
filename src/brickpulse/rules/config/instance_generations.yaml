@@ -1,0 +1,95 @@
+# Maintained mapping for the `instance_generation_modernize` rule:
+# previous-generation instance families -> the current-generation families that
+# replace them (x86) and, where Databricks runs them, the Arm families
+# (AWS Graviton).
+#
+# How it is used
+#   * `from` is a regex on the FULL node type name (anchored with ^...$ by the rule).
+#     A node type matching no entry is never flagged. Leave a family out rather than
+#     guess.
+#   * `x86` / `arm` are ordered lists of target FAMILY regexes. The rule only
+#     suggests a concrete node type that also appears in system.compute.node_types
+#     (so it exists for this account/region), has the SAME core count, the same or
+#     more memory (>= min_memory_ratio from thresholds.yaml), and no GPU. The first
+#     family in the list with a fitting type wins, unless a later one has a MEASURED
+#     DBU rate and the first does not.
+#   * `min_dbr` is the lowest Databricks Runtime that supports the target family
+#     (null = any supported runtime). The rule compares it with the resource's
+#     runtime and tells the user to upgrade first when it is below.
+#
+# What it deliberately leaves out
+#   * GPU families (g4dn, p3, ...): the waste is in accelerator choice, which is
+#     gpu_wrong_runtime's area and is not measurable here.
+#   * AWS fleet types (m-fleet, rd-fleet, ...): AWS already picks a current type.
+#   * Storage-dense and specialty families with no like-for-like successor
+#     (i3en, d3, z1d, x1, m5zn), plus 5th-gen network/AMD variants whose successors
+#     differ in shape (m5dn is kept: it maps cleanly to m6id).
+#   * Azure Arm (Dpsv5 / Cobalt) and GCP Arm (T2A / Axion): Databricks support is not
+#     confirmed, so they are not suggested.
+#
+# Review this file when a new generation ships: add the new family FIRST in `x86`
+# or `arm`, and move the family it replaces into a `from` pattern.
+
+aws:
+  # Storage-optimized (local NVMe; the disk cache family). i4i keeps local NVMe.
+  - from: 'i2\..+'
+    x86: ['i4i']
+    arm: ['i4g']
+    min_dbr: {arm: '9.1'}
+  - from: 'i3\..+'
+    x86: ['i4i']
+    arm: ['i4g']
+    min_dbr: {arm: '9.1'}
+  # General purpose, no local disk.
+  - from: '(m4|m5|m5a|m5n)\..+'
+    x86: ['m7i', 'm6i']
+    arm: ['m7g', 'm6g']
+    min_dbr: {arm: '9.1'}
+  # General purpose with local NVMe: keep a "d" variant so the disk cache survives.
+  - from: '(m5d|m5dn)\..+'
+    x86: ['m6id']
+    arm: ['m7gd', 'm6gd']
+    min_dbr: {arm: '9.1'}
+  # Memory optimized, no local disk.
+  - from: '(r3|r4|r5|r5a|r5n)\..+'
+    x86: ['r7i', 'r6i']
+    arm: ['r7g', 'r6g']
+    min_dbr: {arm: '9.1'}
+  # Memory optimized with local NVMe.
+  - from: '(r5d|r5dn)\..+'
+    x86: ['r6id']
+    arm: ['r7gd', 'r6gd']
+    min_dbr: {arm: '9.1'}
+  # Compute optimized, no local disk.
+  - from: '(c4|c5|c5a|c5n)\..+'
+    x86: ['c7i', 'c6i']
+    arm: ['c7g', 'c6g']
+    min_dbr: {arm: '9.1'}
+  # Compute optimized with local NVMe.
+  - from: '(c5d|c5ad)\..+'
+    x86: ['c6id']
+    arm: ['c7gd', 'c6gd']
+    min_dbr: {arm: '9.1'}
+
+azure:
+  # Dsv2 / DSv2 (Broadwell/Haswell era) -> Ddsv5 (local temp disk) / Dsv5.
+  - from: 'Standard_DS?\d+_v2'
+    x86: ['Standard_D\d+ds_v5', 'Standard_D\d+s_v5']
+  # Dsv3 -> Dsv5 family.
+  - from: 'Standard_D\d+s_v3'
+    x86: ['Standard_D\d+ds_v5', 'Standard_D\d+s_v5']
+  # Esv3 / Edsv4-era memory optimized -> Edsv5 / Esv5.
+  - from: 'Standard_E\d+s_v3'
+    x86: ['Standard_E\d+ds_v5', 'Standard_E\d+s_v5']
+  # Fsv1 -> Fsv2.
+  - from: 'Standard_F\d+s'
+    x86: ['Standard_F\d+s_v2']
+
+gcp:
+  # N1 (Skylake/Broadwell) -> N2, same shape names.
+  - from: 'n1-standard-\d+'
+    x86: ['n2-standard']
+  - from: 'n1-highmem-\d+'
+    x86: ['n2-highmem']
+  - from: 'n1-highcpu-\d+'
+    x86: ['n2-highcpu']

@@ -1,0 +1,195 @@
+{% import '_macros.sql.j2' as m with context %}
+{% set recency_days = recency_days | default(7) %}
+-- Rule: idle_zombie_clusters
+-- Candidate all-purpose (UI/API) clusters that still exist (delete_time IS NULL)
+-- and sit essentially idle -- their average CPU is below the idle threshold and
+-- they have accumulated a sustained number of idle sampling windows. Joined to
+-- their billed cost (usage x list_prices => real USD) so score() can price the
+-- (almost entirely wasted) spend.
+--
+-- FORMULA HEADER:
+--   cost basis     : dbx_list (pricing.effective_list) via the shared price_rate/
+--                    price_join macros, over the standard closed-open window.
+--   units          : idle FRACTION = idle windows / total windows (node_timeline
+--                    per-minute CPU). The reclaimable spend is cost x idle_fraction.
+--   forward guard  : the ACTIONABLE saving is sized on a short RECENT window
+--                    (recency_days, default 7), NOT the whole lookback. A cluster
+--                    that ran hot early in the lookback but has since STOPPED has
+--                    ~0 recent spend, so terminating it saves nothing going forward
+--                    -- it is hygiene ($0), not the whole-lookback annualization the
+--                    old code booked (idle_zombie_clusters.py:93). recent_windows /
+--                    recent_cost_usd / recent_active_days carry that signal to score().
+--   savings_status : score() emits ESTIMATED for a cluster STILL running idle now
+--                    (CPU idle is only a PROXY for true inactivity -- a held
+--                    notebook/stream can keep a low-CPU cluster alive -- so it is
+--                    never booked); ADVISORY ($0) for a STOPPED cluster (no recent
+--                    spend => terminating it reclaims nothing forward; the historical
+--                    idle waste is shown only as max-addressable context).
+--   invariants     : forward saving <= recent monthly spend; low <= point <= high;
+--                    stopped cluster => $0 forward; every join keyed
+--                    (workspace_id, cluster_id) so a duplicated id never bleeds.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py) so this same SQL serves both
+-- account-wide precompute and workspace-scoped live queries.
+--
+-- Current (non-deleted) version of every candidate cluster, via the shared
+-- macro: rank ALL versions per (workspace_id, cluster_id) then keep rn=1 AND
+-- delete_time IS NULL, so a since-deleted cluster is dropped rather than resurrected
+-- from an older live row. This also replaces the earlier DBSQL-only QUALIFY, which
+-- the hermetic local-Spark gate could not parse (same migration interactive_to_job /
+-- warehouse_autostop / idle_serving_endpoints made). cluster_source IN ('UI','API')
+-- is a version-invariant business filter, so it rides along inside the rank scan:
+-- we keep only interactive all-purpose clusters (created in the UI or via
+-- API/Terraform/DAB) and exclude ephemeral, platform-managed sources (JOB, PIPELINE,
+-- MODELS, SQL, ...) which should never be flagged for idle/terminate.
+WITH
+{{ m.latest_scd_cte('candidates', tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, cluster_source, worker_node_type, worker_count, auto_termination_minutes, delete_time',
+     where="cluster_source IN ('UI', 'API')") }},
+util AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    AVG(cpu_pct) AS avg_cpu,
+    COUNT_IF(cpu_pct < {{ idle_cpu_pct_threshold }}) AS idle_windows,
+    COUNT(*) AS total_windows,
+    -- Distinct calendar days on which this cluster was seen running at all. A
+    -- cluster that only came into existence yesterday cannot be called a zombie:
+    -- score() suppresses it below min_observation_days (finops_rules.history).
+    COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days,
+    -- RECENCY-windowed activity (forward-spend guard). A cluster that has
+    -- STOPPED produces 0 recent windows here, so score() treats it as hygiene ($0)
+    -- rather than annualizing its stale whole-lookback cost as ongoing savings. The
+    -- recency predicate is closed-open (window_lower) so today's partial data never
+    -- leaks in, same as the lookback window above.
+    SUM(CASE WHEN {{ m.window_lower('start_time', days=recency_days) }} THEN 1 ELSE 0 END) AS recent_windows,
+    COUNT_IF(({{ m.window_lower('start_time', days=recency_days) }}) AND cpu_pct < {{ idle_cpu_pct_threshold }}) AS recent_idle_windows,
+    AVG(CASE WHEN {{ m.window_lower('start_time', days=recency_days) }} THEN cpu_pct END) AS recent_avg_cpu,
+    COUNT(DISTINCT CASE WHEN {{ m.window_lower('start_time', days=recency_days) }} THEN CAST(start_time AS DATE) END) AS recent_active_days
+  FROM (
+    SELECT workspace_id, cluster_id, start_time,
+           (cpu_user_percent + cpu_system_percent) AS cpu_pct
+    FROM {{ tbl('compute','node_timeline') }}
+    WHERE {{ m.window_lower('start_time') }}
+  )
+  GROUP BY 1, 2
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    -- Recent (last recency_days) billed cost: the forward spend rate score()
+    -- annualizes, instead of the whole-lookback total. Closed-open (window_lower).
+    SUM(CASE WHEN {{ m.window_lower('u.usage_date', days=recency_days) }} THEN u.usage_quantity * {{ m.price_rate('lp') }} ELSE 0 END) AS recent_cost_usd{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'cluster_id') }},
+-- Recurring job activity on the cluster (the one command-level signal system
+-- tables expose for compute). A cluster kept up by a schedule is NOT a "zombie
+-- to terminate" -- terminating would break the job. score() uses this to defer
+-- such clusters to interactive_to_job / cluster_autotermination instead.
+-- NB: only job_task_run_timeline populates compute_ids; job_run_timeline leaves
+-- it empty, so the cluster<->job link must come from the TASK-level table.
+jobs AS (
+  SELECT workspace_id, cluster_id, COUNT(*) AS job_runs_30d
+  FROM (
+    SELECT workspace_id, run_id, explode(compute_ids) AS cluster_id
+    FROM {{ tbl('lakeflow','job_task_run_timeline') }}
+    WHERE {{ m.window_lower('period_start_time') }}
+      AND size(compute_ids) > 0
+  )
+  GROUP BY 1, 2
+),
+-- Hourly RESOURCE series so score() can chart what the cluster is actually doing:
+-- CPU alone can't separate "abandoned" from "memory-bound" or "I/O-starved", and
+-- those warrant different actions. All metrics travel index-aligned with cpu_ts.
+-- (node_timeline has no disk read/write rate, only free space per mount point, so
+-- CPU I/O wait stands in for storage pressure.)
+cpu_series AS (
+  SELECT workspace_id, cluster_id,
+         transform(sorted, x -> x.cpu) AS cpu_hourly,
+         transform(sorted, x -> x.ts) AS cpu_ts,
+         transform(sorted, x -> x.idle) AS idle_frac,
+         transform(sorted, x -> x.peak) AS cpu_peak,
+         transform(sorted, x -> x.mem) AS mem_hourly,
+         transform(sorted, x -> x.swap) AS swap_hourly,
+         transform(sorted, x -> x.iowait) AS iowait_hourly,
+         transform(sorted, x -> x.net) AS net_hourly,
+         p95_cpu,
+         avg_mem_pct,
+         peak_mem_pct
+  FROM (
+    SELECT workspace_id, cluster_id,
+           array_sort(
+             collect_list(struct(h AS h, cpu AS cpu, unix_timestamp(h) AS ts, idle AS idle,
+                                 peak AS peak, mem AS mem, swap AS swap,
+                                 iowait AS iowait, net AS net)),
+             (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END
+           ) AS sorted,
+           percentile_approx(cpu, 0.95) AS p95_cpu,
+           AVG(mem) * 100.0 AS avg_mem_pct,
+           MAX(mem) * 100.0 AS peak_mem_pct
+    FROM (
+      SELECT workspace_id, cluster_id, date_trunc('HOUR', start_time) AS h,
+             AVG(cpu_user_percent + cpu_system_percent) / 100.0 AS cpu,
+             AVG(CASE WHEN cpu_user_percent + cpu_system_percent < 10 THEN 1.0 ELSE 0.0 END) AS idle,
+             MAX(cpu_user_percent + cpu_system_percent) / 100.0 AS peak,
+             AVG(mem_used_percent) / 100.0 AS mem,
+             AVG(COALESCE(mem_swap_percent, 0)) / 100.0 AS swap,
+             AVG(COALESCE(cpu_wait_percent, 0)) / 100.0 AS iowait,
+             AVG(COALESCE(network_received_bytes, 0) + COALESCE(network_sent_bytes, 0)) AS net
+      FROM {{ tbl('compute','node_timeline') }}
+      WHERE {{ m.window_lower('start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, cluster_id
+  )
+)
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  -- What KIND of cluster this is, shown first on the detail page: "idle" means
+  -- something different for an all-purpose cluster than for a job cluster.
+  c.cluster_source,
+  c.worker_node_type AS node_type_id,
+  c.worker_count,
+  c.auto_termination_minutes,
+  util.avg_cpu AS avg_cpu,
+  util.idle_windows AS idle_windows,
+  util.total_windows AS total_windows,
+  util.observed_days AS observed_days,
+  -- Forward-spend guard signals: score() sizes the actionable saving
+  -- on these RECENT figures, not the whole-lookback totals above.
+  util.recent_windows AS recent_windows,
+  util.recent_idle_windows AS recent_idle_windows,
+  util.recent_avg_cpu AS recent_avg_cpu,
+  util.recent_active_days AS recent_active_days,
+  COALESCE(cost.recent_cost_usd, 0) AS recent_cost_usd,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,{{ m.contract_cost_select('cost') }}{{ m.cloud_cost_select() }}
+  COALESCE(jobs.job_runs_30d, 0) AS job_runs_30d,
+  cpu_series.cpu_hourly,
+  cpu_series.cpu_ts,
+  cpu_series.idle_frac,
+  cpu_series.cpu_peak,
+  cpu_series.mem_hourly,
+  cpu_series.swap_hourly,
+  cpu_series.iowait_hourly,
+  cpu_series.net_hourly,
+  cpu_series.p95_cpu,
+  cpu_series.avg_mem_pct,
+  cpu_series.peak_mem_pct
+FROM candidates c
+JOIN util USING (workspace_id, cluster_id)
+LEFT JOIN cost USING (workspace_id, cluster_id){{ m.cloud_cost_join('cloud_cost', 'c', 'cluster_id') }}
+LEFT JOIN jobs USING (workspace_id, cluster_id)
+LEFT JOIN cpu_series USING (workspace_id, cluster_id)
+WHERE util.total_windows > 0
+  AND util.avg_cpu < {{ idle_cpu_pct_threshold }}
+  AND util.idle_windows >= {{ min_idle_windows }}

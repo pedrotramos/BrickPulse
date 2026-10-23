@@ -1,0 +1,89 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: spot_fallback
+-- Candidate classic (customer-managed) clusters running ON_DEMAND workers that
+-- could move to SPOT_WITH_FALLBACK. Joins each cluster's latest config (to read
+-- its cloud availability mode + worker count) to its recent billed classic
+-- compute cost so score() can price the size-capped, eviction-netted saving.
+--
+-- SCOPE (mirrors the source analysis):
+--   * Classic, customer-managed compute only: ALL_PURPOSE, JOBS, DLT.
+--   * Serverless / model serving / DBSQL excluded -- spot is not a
+--     customer-controlled lever there.
+--   * Single-node clusters (0 workers) excluded -- the driver always stays
+--     on-demand, so there is no worker to move to spot.
+--   * Only clusters CURRENTLY on ON_DEMAND (SPOT / SPOT_WITH_FALLBACK already
+--     capture the saving) are emitted as candidates.
+--
+-- Cloud-agnostic: availability lives under aws_/azure_/gcp_attributes; we
+-- coalesce whichever the cluster has so this runs account-wide on any cloud.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py) so this same SQL serves both
+-- account-wide precompute and workspace-scoped live queries.
+--
+-- Current (non-deleted) version of every cluster via the shared macro:
+-- rank ALL versions per (workspace_id, cluster_id) then keep rn=1 AND delete_time
+-- IS NULL, so a since-deleted cluster is not resurrected from an older live row.
+-- This also replaces the earlier DBSQL-only QUALIFY (which the hermetic local-Spark
+-- gate cannot parse) and adds the delete guard the QUALIFY form never had — same
+-- migration interactive_to_job / idle_zombie_clusters / warehouse_autostop made.
+-- The cloud CASE derives which attributes block carries the availability; the
+-- spot/on-demand gap is cloud-specific but is no longer priced from DBU cost.
+WITH
+{{ m.latest_scd_cte('latest_clusters', tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols="workspace_id, cluster_id, cluster_name, cluster_source, worker_node_type, COALESCE(worker_count, max_autoscale_workers, 0) AS workers, COALESCE(aws_attributes.availability, azure_attributes.availability, gcp_attributes.availability) AS availability, CASE WHEN aws_attributes.availability IS NOT NULL THEN 'aws' WHEN azure_attributes.availability IS NOT NULL THEN 'azure' WHEN gcp_attributes.availability IS NOT NULL THEN 'gcp' END AS cloud, delete_time") }},
+candidates AS (
+  SELECT
+    workspace_id,
+    cluster_id,
+    cluster_name,
+    cluster_source,
+    worker_node_type,
+    workers,
+    availability,
+    cloud
+  FROM latest_clusters
+  WHERE workers >= 1                          -- multi-node only (driver stays on-demand)
+    AND UPPER(COALESCE(availability, '')) LIKE 'ON_DEMAND%'
+),
+-- Classic (non-serverless) compute cost per cluster over the lookback window,
+-- attributed to real dollars via list_prices. Excludes serverless usage.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    -- Distinct billed days: this rule's only evidence is spend, so spend days ARE
+    -- the observation window. One day of on-demand cost extrapolates to a monthly
+    -- figure the cluster may never repeat, so score() suppresses below
+    -- min_observation_days (finops_rules.history).
+    COUNT(DISTINCT u.usage_date) AS observed_days
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+    AND u.usage_unit = 'DBU'
+    AND COALESCE(u.product_features.is_serverless, false) = false
+    AND u.billing_origin_product IN ('ALL_PURPOSE', 'JOBS', 'DLT')
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'cluster_id') }}
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  c.cluster_source,
+  c.worker_node_type,
+  c.workers,
+  c.availability,
+  c.cloud,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(cost.observed_days, 0) AS observed_days{{ m.cloud_cost_select(lead=True) }}
+FROM candidates c
+LEFT JOIN cost USING (workspace_id, cluster_id){{ m.cloud_cost_join('cloud_cost', 'c', 'cluster_id') }}

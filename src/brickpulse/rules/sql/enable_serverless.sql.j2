@@ -1,0 +1,129 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: enable_serverless
+-- Candidate CLASSIC (non-serverless) SQL warehouses with meaningful recent spend.
+-- Emits (a) real USD from billing usage x list_prices, (b) the same 14-day DENSE
+-- hourly state series as warehouse_autostop (0=stopped 1=active 2=idle-warm) so
+-- score() can bound savings to the measured idle warm-pool, and (c) the average
+-- cold-start wait from query.history (the serverless "no wait" argument).
+--
+-- NOTE (live-validation follow-up): the hourly reconstruction infers "warm" from
+-- billed usage per hour and "active" from query.history. It renders and executes
+-- against system tables but is best-effort until benchmarked end-to-end.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py).
+WITH cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+    AND u.billing_origin_product = 'SQL'
+    AND u.product_features.is_serverless = false  -- NOTE: verify column
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'warehouse_id') }},
+-- Current (non-deleted) version of each warehouse, via the shared macro:
+-- rank ALL versions then keep rn=1 AND delete_time IS NULL. PORTABLE: the earlier
+-- QUALIFY was DBSQL-only and the hermetic local-Spark gate could not parse it (same
+-- migration warehouse_autostop / idle_serving_endpoints / the other rules made).
+{{ m.latest_scd_cte(
+     'latest_warehouses',
+     tbl('compute','warehouses'),
+     'workspace_id, warehouse_id',
+     select_cols='workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size, delete_time') }},
+hours AS (
+  SELECT explode(sequence(
+    date_trunc('HOUR', current_timestamp() - INTERVAL 14 DAYS),
+    date_trunc('HOUR', current_timestamp()) - INTERVAL 1 HOUR,
+    INTERVAL 1 HOUR
+  )) AS h
+),
+warm AS (
+  -- carry workspace_id so warm hours cannot bleed across workspaces
+  -- that happen to share a warehouse_id.
+  SELECT workspace_id,
+         usage_metadata.warehouse_id AS warehouse_id,
+         date_trunc('HOUR', usage_start_time) AS h
+  FROM {{ tbl('billing','usage') }}
+  WHERE usage_metadata.warehouse_id IS NOT NULL
+    AND usage_start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2, 3
+),
+active AS (
+  SELECT workspace_id,
+         compute.warehouse_id AS warehouse_id,
+         date_trunc('HOUR', start_time) AS h
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2, 3
+),
+grid AS (
+  SELECT c.workspace_id, c.warehouse_id, hh.h,
+         CASE WHEN act.warehouse_id IS NOT NULL THEN 1
+              WHEN wm.warehouse_id IS NOT NULL THEN 2
+              ELSE 0 END AS state
+  FROM cost c
+  CROSS JOIN hours hh
+  LEFT JOIN warm wm    ON wm.workspace_id = c.workspace_id AND wm.warehouse_id = c.warehouse_id AND wm.h = hh.h
+  LEFT JOIN active act ON act.workspace_id = c.workspace_id AND act.warehouse_id = c.warehouse_id AND act.h = hh.h
+),
+series AS (
+  SELECT workspace_id, warehouse_id,
+         transform(
+           array_sort(collect_list(struct(h AS h, state AS state)),
+                      (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END),
+           x -> x.state
+         ) AS hourly_states,
+         -- First hour of the series, so the heatmap can align rows to UTC days.
+         MIN(h) AS grid_start
+  FROM grid
+  GROUP BY 1, 2
+),
+coldstart AS (
+  SELECT workspace_id,
+         compute.warehouse_id AS warehouse_id,
+         AVG(waiting_for_compute_duration_ms) / 1000.0 AS avg_cold_start_s
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2
+),
+-- Distinct days the warehouse served queries. The warm-pool idle share that
+-- justifies serverless is a property of the usage rhythm, so a warehouse observed
+-- for a day or two is suppressed by score() (min_observation_days; see
+-- finops_rules.history) rather than migrated on one day's evidence.
+observed AS (
+  SELECT workspace_id,
+         compute.warehouse_id AS warehouse_id,
+         COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2
+)
+SELECT
+  c.workspace_id,
+  c.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('c') }}{{ m.cloud_cost_select() }}
+  series.hourly_states,
+  series.grid_start,
+  COALESCE(cs.avg_cold_start_s, 0) AS avg_cold_start_s,
+  COALESCE(ob.observed_days, 0) AS observed_days
+FROM cost c{{ m.cloud_cost_join('cloud_cost', 'c', 'warehouse_id') }}
+LEFT JOIN latest_warehouses w USING (workspace_id, warehouse_id)
+LEFT JOIN series USING (workspace_id, warehouse_id)
+LEFT JOIN coldstart cs USING (workspace_id, warehouse_id)
+LEFT JOIN observed ob USING (workspace_id, warehouse_id)

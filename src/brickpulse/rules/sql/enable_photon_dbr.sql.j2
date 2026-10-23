@@ -1,0 +1,33 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: enable_photon_dbr
+-- Current all-purpose (UI) clusters joined to their recent billed cost
+-- (usage x list_prices => real USD). The DBR-version candidate check is done in
+-- Python (score() parses the major version), so this SQL just returns the
+-- current clusters and their attributed 30d cost.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer so this same SQL serves both account-wide precompute and
+-- workspace-scoped live queries.
+WITH
+-- Current cluster version: rank ALL versions, then keep the live one.
+-- Filtering delete_time before ranking would resurrect an older version of a
+-- since-deleted cluster. cluster_source is immutable per cluster, so it may
+-- prune the scan in the inner WHERE.
+{{ m.latest_scd_cte(
+     'latest_clusters',
+     tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, dbr_version, delete_time',
+     where="cluster_source IN ('UI', 'API')") }},
+{{ m.usage_cost_cte('cost', 'u.usage_metadata.cluster_id', 'cluster_id') }}
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  c.dbr_version,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(cost.observed_days, 0) AS observed_days{{ m.contract_cost_select('cost', lead=True) }}
+FROM latest_clusters c
+LEFT JOIN cost USING (workspace_id, cluster_id)

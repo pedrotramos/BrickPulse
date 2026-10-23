@@ -1,0 +1,260 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: allpurpose_shape_mismatch  (Tier 1, B6 — experimental / Labs)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the cluster's billed usage).
+--   units:           per-node-minute utilization from system.compute.node_timeline,
+--                    split DRIVER vs WORKER via its `driver` flag; the cluster's own
+--                    corrected cost; OBSERVED DBUs per node-hour per node type.
+--   counterfactual:  the cluster's SHAPE is wrong, not its size:
+--                      * driver_bound       — while the cluster is doing anything, the
+--                        driver works and the workers idle (pandas / single-machine
+--                        code on a multi-node cluster) -> single-node frees the
+--                        worker share for the driver-only share of active time;
+--                      * memory_family      — a memory-dense worker family (>= N GB per
+--                        core) whose workers peak (p95) far below their memory -> a
+--                        general-purpose type with the SAME cores frees the observed
+--                        DBU/node-hour delta on the worker share;
+--                      * compute_family_pressure — a compute-optimized worker family
+--                        under memory pressure (swap / p95 memory) -> a general-purpose
+--                        type (a reliability/performance fix, $0).
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      addressable <= corrected cluster cost; closed-open window;
+--                    coverage-guarded; the DBU-rate delta is MEASURED from this
+--                    account's billing (no rate card), never assumed.
+--
+-- DBU rate per node type: system tables carry no DBU rate per instance type. We
+-- measure it: for HOMOGENEOUS clusters (driver type = worker type) and cluster-HOURS
+-- where node_timeline shows a constant node set for the full hour (node-minutes =
+-- nodes x 60), DBUs billed that hour / nodes = DBUs per node-hour. Taken across the
+-- account (all cluster sources — the DBU count per node is the same for jobs and
+-- all-purpose compute; only the $/DBU differs), keyed by (node_type, photon), and
+-- kept only when stable (p25..p75 spread within rate_spread_max of the median) over
+-- >= min_rate_clusters clusters. Verified live: i3.xlarge 1.00, m5d.xlarge 0.69,
+-- r5d.xlarge 0.90 — the published rates, exactly. A target type never billed in the
+-- account has no measured rate, so it is suggested without a dollar figure.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH {{ m.latest_scd_cte(
+     'latest_clusters',
+     tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, cluster_source, driver_node_type, worker_node_type, worker_count, min_autoscale_workers, max_autoscale_workers, delete_time') }},
+candidates AS (
+  -- Interactive all-purpose clusters (UI or API/Terraform/DAB-created), still alive.
+  SELECT * FROM latest_clusters WHERE cluster_source IN ('UI', 'API')
+),
+node_types AS (  -- dedupe node-type specs (per-account/region rows)
+  SELECT node_type, MAX(core_count) AS core_count, MAX(memory_mb) AS memory_mb,
+         MAX(COALESCE(gpu_count, 0)) AS gpu_count
+  FROM {{ tbl('compute','node_types') }}
+  GROUP BY node_type
+),
+node AS (  -- per-node-minute samples for the candidates, driver-tagged
+  SELECT
+    n.workspace_id, n.cluster_id, n.start_time, n.driver,
+    n.cpu_user_percent + n.cpu_system_percent AS cpu,
+    n.mem_used_percent AS mem,
+    COALESCE(n.mem_swap_percent, 0) AS swap
+  FROM {{ tbl('compute','node_timeline') }} n
+  JOIN candidates c USING (workspace_id, cluster_id)
+  WHERE {{ m.window_lower('n.start_time') }}
+),
+minute AS (  -- one row per cluster-minute: what the driver and the workers were doing
+  SELECT
+    workspace_id, cluster_id, start_time,
+    MAX(CASE WHEN driver THEN cpu END) AS driver_cpu,
+    AVG(CASE WHEN NOT driver THEN cpu END) AS worker_cpu,
+    MAX(CASE WHEN NOT driver THEN cpu END) AS worker_cpu_max,
+    SUM(CASE WHEN NOT driver THEN 1 ELSE 0 END) AS workers
+  FROM node
+  GROUP BY 1, 2, 3
+),
+minute_flagged AS (
+  -- An ACTIVE minute = the driver or any worker did real work. Interactive clusters
+  -- idle most of the time, so averaging over every running minute would read every
+  -- cluster as "workers idle"; the shape question is only meaningful while it works.
+  SELECT *,
+    (COALESCE(driver_cpu, 0) >= {{ active_cpu_pct }}
+      OR COALESCE(worker_cpu_max, 0) >= {{ active_cpu_pct }}) AS active
+  FROM minute
+),
+activity AS (
+  SELECT
+    workspace_id, cluster_id,
+    COUNT(*) AS running_minutes,
+    SUM(CASE WHEN active THEN 1 ELSE 0 END) AS active_minutes,
+    -- Active minutes where the driver worked and EVERY worker idled: the
+    -- driver-bound signature. Minutes with no workers at all don't count.
+    SUM(CASE WHEN active AND workers > 0
+              AND COALESCE(driver_cpu, 0) >= {{ active_cpu_pct }}
+              AND COALESCE(worker_cpu_max, 0) < {{ worker_idle_cpu_pct }}
+             THEN 1 ELSE 0 END) AS driver_only_minutes,
+    AVG(CASE WHEN active THEN driver_cpu END) AS active_driver_cpu,
+    AVG(CASE WHEN active THEN worker_cpu END) AS active_worker_cpu,
+    -- p95 of the worker average over ACTIVE minutes: a burst the workers exist to
+    -- serve vetoes going single-node (the peak veto, all-purpose edition).
+    percentile_approx(CASE WHEN active THEN worker_cpu END, 0.95) AS active_worker_p95_cpu,
+    AVG(workers) AS avg_workers
+  FROM minute_flagged
+  GROUP BY 1, 2
+),
+util AS (  -- per-node averages + p95 peaks, 0-100 scale, driver vs worker
+  SELECT
+    workspace_id, cluster_id,
+    SUM(CASE WHEN driver THEN 1 ELSE 0 END) AS driver_node_minutes,
+    SUM(CASE WHEN NOT driver THEN 1 ELSE 0 END) AS worker_node_minutes,
+    AVG(CASE WHEN NOT driver THEN mem END) AS worker_mem,
+    AVG(CASE WHEN driver THEN mem END) AS driver_mem,
+    percentile_approx(CASE WHEN NOT driver THEN mem END, 0.95) AS worker_p95_mem,
+    percentile_approx(CASE WHEN driver THEN mem END, 0.95) AS driver_p95_mem,
+    percentile_approx(CASE WHEN NOT driver THEN swap END, 0.95) AS worker_p95_swap,
+    AVG(CASE WHEN NOT driver THEN cpu END) AS worker_cpu,
+    AVG(CASE WHEN driver THEN cpu END) AS driver_cpu,
+    -- Distinct days the cluster was seen running (finops_rules.history guard).
+    COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM node
+  GROUP BY 1, 2
+),
+cost AS (  -- the cluster's corrected cost + whether it runs Photon (rate key)
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    MAX(CASE WHEN u.sku_name LIKE '%PHOTON%' THEN 1 ELSE 0 END) AS photon
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- ======================= OBSERVED DBU / NODE-HOUR per node type ==================
+homogeneous AS (  -- every cluster (any source) whose driver and workers share a type
+  SELECT workspace_id, cluster_id, worker_node_type AS node_type
+  FROM (
+    SELECT workspace_id, cluster_id, worker_node_type, driver_node_type,
+           ROW_NUMBER() OVER (
+             PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','clusters') }}
+  )
+  WHERE rn = 1 AND worker_node_type = driver_node_type
+),
+node_hours AS (
+  SELECT n.workspace_id, n.cluster_id, date_trunc('HOUR', n.start_time) AS h,
+         COUNT(*) AS node_minutes, COUNT(DISTINCT n.instance_id) AS nodes
+  FROM {{ tbl('compute','node_timeline') }} n
+  JOIN homogeneous hc USING (workspace_id, cluster_id)
+  WHERE {{ m.window_lower('n.start_time') }}
+  GROUP BY 1, 2, 3
+),
+billed_hours AS (
+  SELECT workspace_id, usage_metadata.cluster_id AS cluster_id,
+         date_trunc('HOUR', usage_start_time) AS h,
+         MAX(CASE WHEN sku_name LIKE '%PHOTON%' THEN 1 ELSE 0 END) AS photon,
+         SUM(usage_quantity) AS dbus
+  FROM {{ tbl('billing','usage') }}
+  WHERE {{ m.window_lower('usage_date') }}
+    AND usage_metadata.cluster_id IS NOT NULL
+    AND usage_unit = 'DBU'
+  GROUP BY 1, 2, 3
+),
+node_rates AS (
+  SELECT node_type, photon, rate AS dbu_per_node_hour
+  FROM (
+    SELECT hc.node_type, bh.photon,
+           COUNT(DISTINCT hc.cluster_id) AS clusters,
+           percentile_approx(bh.dbus / nh.nodes, 0.5) AS rate,
+           percentile_approx(bh.dbus / nh.nodes, 0.25) AS p25,
+           percentile_approx(bh.dbus / nh.nodes, 0.75) AS p75
+    FROM homogeneous hc
+    JOIN node_hours nh USING (workspace_id, cluster_id)
+    JOIN billed_hours bh USING (workspace_id, cluster_id, h)
+    WHERE nh.node_minutes = nh.nodes * 60  -- constant node set for the whole hour
+      AND bh.dbus > 0
+    GROUP BY 1, 2
+  )
+  WHERE clusters >= {{ min_rate_clusters }}
+    AND rate > 0
+    AND p75 - p25 <= {{ rate_spread_max }} * rate
+),
+rates_by_type AS (
+  SELECT node_type,
+         MAX(CASE WHEN photon = 0 THEN dbu_per_node_hour END) AS rate_std,
+         MAX(CASE WHEN photon = 1 THEN dbu_per_node_hour END) AS rate_photon
+  FROM node_rates
+  GROUP BY node_type
+),
+-- Same-core, less-memory, non-GPU, general-purpose-density alternatives to each
+-- candidate's worker type. Python picks the target (fit + cheapest measured rate).
+alternatives AS (
+  SELECT c.workspace_id, c.cluster_id,
+         collect_list(named_struct(
+           'node_type', alt.node_type,
+           'memory_mb', alt.memory_mb,
+           'rate_std', r.rate_std,
+           'rate_photon', r.rate_photon)) AS alt_node_types
+  FROM candidates c
+  JOIN node_types cur ON cur.node_type = c.worker_node_type
+  JOIN node_types alt
+    ON alt.core_count = cur.core_count
+   AND alt.memory_mb < cur.memory_mb
+   AND alt.gpu_count = 0
+   AND alt.memory_mb / 1024.0 / alt.core_count <= {{ general_max_gb_per_core }}
+  LEFT JOIN rates_by_type r ON r.node_type = alt.node_type
+  GROUP BY 1, 2
+)
+SELECT
+  c.workspace_id,
+  c.cluster_id,
+  c.cluster_name,
+  c.cluster_source,
+  c.driver_node_type,
+  c.worker_node_type,
+  c.worker_node_type AS node_type_id,
+  c.worker_count,
+  c.min_autoscale_workers,
+  c.max_autoscale_workers,
+  dnt.core_count AS driver_cores,
+  dnt.memory_mb AS driver_memory_mb,
+  wnt.core_count AS worker_cores,
+  wnt.memory_mb AS worker_memory_mb,
+  COALESCE(wnt.gpu_count, 0) AS worker_gpu_count,
+  util.observed_days,
+  util.driver_node_minutes,
+  util.worker_node_minutes,
+  util.worker_mem,
+  util.driver_mem,
+  util.worker_p95_mem,
+  util.driver_p95_mem,
+  util.worker_p95_swap,
+  util.worker_cpu,
+  util.driver_cpu,
+  act.running_minutes,
+  act.active_minutes,
+  act.driver_only_minutes,
+  act.active_driver_cpu,
+  act.active_worker_cpu,
+  act.active_worker_p95_cpu,
+  act.avg_workers,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(cost.photon, 0) AS photon,
+  cr.rate_std AS current_rate_std,
+  cr.rate_photon AS current_rate_photon,
+  alts.alt_node_types
+FROM candidates c
+JOIN util USING (workspace_id, cluster_id)
+JOIN activity act USING (workspace_id, cluster_id)
+LEFT JOIN cost USING (workspace_id, cluster_id)
+LEFT JOIN node_types dnt ON dnt.node_type = c.driver_node_type
+LEFT JOIN node_types wnt ON wnt.node_type = c.worker_node_type
+LEFT JOIN rates_by_type cr ON cr.node_type = c.worker_node_type
+LEFT JOIN alternatives alts USING (workspace_id, cluster_id)
+-- Only clusters that actually ran workers and cost something: a single-node
+-- cluster has no worker shape to fix.
+WHERE util.worker_node_minutes > 0
+  AND COALESCE(cost.cost_30d_usd, 0) > 0

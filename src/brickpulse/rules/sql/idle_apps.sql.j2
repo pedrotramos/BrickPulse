@@ -1,0 +1,83 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: idle_apps
+-- Databricks Apps that bill CONTINUOUSLY (deployed + running serverless compute,
+-- billing_origin_product = 'APPS') but that nobody opens in the window. The direct
+-- analogue of idle_serving_endpoints, for the Apps blind spot ("Idle Apps (no
+-- access last 1 day)").
+--
+-- ACCESS SIGNAL — system.access.audit (app HTTP access). The exact audit shape for
+-- app access (service_name / request_params) is best-effort here and must be
+-- VALIDATED on a workspace that actually hosts Apps before this rule is trusted in
+-- production — the same false-positive risk idle_serving_endpoints documents
+-- (unmatched access reads as "idle" and would flag a BUSY app). Until then the
+-- finding is MEDIUM confidence with a verify-then-act recommendation.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.app_id AS app_id,
+    MAX(u.usage_metadata.app_name) AS app_name,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_window_usd,
+    SUM(u.usage_quantity) AS dbus_window,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    -- Distinct billed days: an always-on app bills every day; a newly deployed one
+    -- has too few days to judge, so score() suppresses below min_observation_days.
+    COUNT(DISTINCT u.usage_date) AS observed_days,
+    COUNT(DISTINCT u.usage_date) AS days_billed{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'APPS'
+    AND u.usage_metadata.app_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- App HTTP access events per app over the window. Best-effort: app access is logged
+-- under the databricksApps service; the app identifier lives in request_params.
+-- VALIDATE this filter on a real workspace before trusting the "no access" signal.
+access AS (
+  SELECT
+    workspace_id,
+    request_params.app_name AS app_name,
+    COUNT(*) AS access_events,
+    COUNT(DISTINCT user_identity.email) AS distinct_users,
+    MAX(event_time) AS last_access_time
+  FROM {{ tbl('access','audit') }}
+  WHERE {{ m.window_lower('event_date') }}
+    AND service_name = 'databricksApps'
+    AND request_params.app_name IS NOT NULL
+  GROUP BY 1, 2
+),
+-- SIGNAL-PRESENCE GATE (per workspace). "access_events = 0" is ambiguous: it means
+-- either "nobody opened this app" OR "this workspace logs no app access at all"
+-- (system.access.audit captures no databricksApps events here — a real
+-- possibility, since the audit shape for app access is unvalidated). Without this
+-- gate the LEFT JOIN below reads every app as idle and flags the whole estate as
+-- waste. So we count, per workspace, the total app-access events seen; score()
+-- suppresses the rule entirely for any workspace with none. A workspace only
+-- earns idle_apps findings once its audit log has PROVEN it captures app access.
+access_signal AS (
+  SELECT workspace_id, COALESCE(SUM(access_events), 0) AS app_access_events_total
+  FROM access
+  GROUP BY 1
+)
+SELECT
+  c.workspace_id,
+  c.app_id,
+  c.app_name,
+  COALESCE(c.cost_window_usd, 0) AS cost_window_usd,
+  COALESCE(c.dbus_window, 0) AS dbus_window,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('c') }}
+  COALESCE(c.observed_days, 0) AS observed_days,
+  COALESCE(c.days_billed, 0) AS days_billed,
+  COALESCE(a.access_events, 0) AS access_events,
+  COALESCE(a.distinct_users, 0) AS distinct_users,
+  a.last_access_time,
+  -- Per-workspace count of ALL app-access events in the window. 0 => no signal
+  -- for this workspace => score() emits nothing (cannot call an app idle blind).
+  COALESCE(s.app_access_events_total, 0) AS app_access_events_total
+FROM cost c
+LEFT JOIN access a
+  ON a.workspace_id = c.workspace_id AND a.app_name = c.app_name
+LEFT JOIN access_signal s
+  ON s.workspace_id = c.workspace_id

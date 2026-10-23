@@ -1,0 +1,56 @@
+[
+  {
+    "id": "01-monograma",
+    "name": "Monograma BP",
+    "color": "#115e67",
+    "description": "As iniciais viram assinatura: direto, compacto e reconhecível.",
+    "meaning": "Uma leitura tipográfica de BrickPulse. O B e o P têm a mesma altura e um desenho próprio, com curvas firmes e espaços abertos.",
+    "tradeoff": "A leitura das duas letras funciona melhor a partir de 24 px.",
+    "number": 1
+  },
+  {
+    "id": "02-encaixe",
+    "name": "Encaixe",
+    "color": "#414797",
+    "description": "Dois módulos se conectam em uma marca arquitetônica.",
+    "meaning": "Dois elos quadrados abertos representam infraestrutura e informação que se complementam. A conexão aparece também em uma só cor.",
+    "tradeoff": "A associação com o nome é abstrata; a força está na silhueta.",
+    "number": 2
+  },
+  {
+    "id": "03-frequencia",
+    "name": "Frequência",
+    "color": "#b94b2c",
+    "description": "O ritmo dos dados em um sinal simples e energético.",
+    "meaning": "Cinco amplitudes desenham um pulso amostrado: a plataforma sendo observada ao longo do tempo, sem recorrer ao traçado de um eletrocardiograma.",
+    "tradeoff": "É a direção mais familiar ao universo de áudio e telemetria.",
+    "number": 3
+  },
+  {
+    "id": "04-foco",
+    "name": "Foco",
+    "color": "#17675d",
+    "description": "Um olhar analítico que encontra o que realmente importa.",
+    "meaning": "Um olho geométrico envolve um losango central: contexto ao redor, evidência no centro. Evoca observabilidade e atenção ao desperdício.",
+    "tradeoff": "O símbolo também pode remeter a segurança e monitoramento.",
+    "number": 4
+  },
+  {
+    "id": "05-fluxo",
+    "name": "Fluxo",
+    "color": "#2759bf",
+    "description": "Um ciclo aberto de observar, entender e otimizar.",
+    "meaning": "Uma fita contínua cruza dois percursos. A interrupção no cruzamento deixa o gesto legível em monocromia e sugere movimento sem animação.",
+    "tradeoff": "O laço se aproxima da família visual dos símbolos de infinito.",
+    "number": 5
+  },
+  {
+    "id": "06-facetado",
+    "name": "B Facetado",
+    "color": "#2f424a",
+    "description": "Uma letra esculpida: sólida, precisa e de alto contraste.",
+    "meaning": "O B é reduzido a um bloco de arestas chanfradas, com duas aberturas que mantêm a leitura. A forma funciona como selo, ícone ou assinatura.",
+    "tradeoff": "É a direção mais industrial e menos orgânica do conjunto.",
+    "number": 6
+  }
+]

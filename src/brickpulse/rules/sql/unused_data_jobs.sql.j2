@@ -1,0 +1,154 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: unused_data_jobs  (Gap G1's sibling — Gap G2, unused-output waste)
+-- A scheduled job that repeatedly writes a table nothing ever reads is spending
+-- compute to produce dead data. system.access.table_lineage records every write
+-- (as target_table) and every read (as source_table); a job whose output tables
+-- appear only as targets, never as sources, is a strong "produced but never
+-- consumed" signal.
+--
+-- METHODOLOGY (measured, conservative, guarded against lineage gaps):
+--   * Writes: TABLE targets written by a JOB entity (target_type='TABLE' — views
+--     / materialized views are excluded; they are derived surfaces).
+--   * Reads: any appearance of a table as a lineage source. A table with zero
+--     read events over the window is "unread".
+--   * A job qualifies only if EVERY one of its output tables is unread, and:
+--       - it writes FEW distinct tables ({{ max_output_tables }}) — a focused
+--         producer, not a sprawling platform whose reads go uncaptured, and
+--       - it rewrote them recurringly ({{ min_writes }}+ writes) — a scheduled
+--         producer, not a one-off table just created.
+--     These guards exist because lineage READ capture is incomplete (reads via
+--     paths / external tools / un-instrumented surfaces don't register), so
+--     "zero reads" is a proxy, not proof — confidence is LOW.
+--   * sentinel: the output table's SCHEMA must show at least one captured
+--     read in lineage (of any table). A schema with no captured reads is "no
+--     coverage", not "dead"; score() suppresses those. The producing cost is then
+--     shown as MAX ADDRESSABLE (books $0, advisory) — no 50/70% haircut guess —
+--     with verification required before it can be booked.
+--   * REAL producing cost is the job's billed compute (usage_metadata.job_id x
+--     list_prices) over the window.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping is injected later).
+WITH writes AS (
+  SELECT
+    workspace_id,
+    entity_id AS job_id,
+    target_table_full_name AS tbl,
+    COUNT(*) AS write_events,
+    MAX(event_time) AS last_write,
+    MIN(event_time) AS first_write
+  FROM {{ tbl('access','table_lineage') }}
+  WHERE entity_type = 'JOB'
+    AND target_type = 'TABLE'
+    AND target_table_full_name IS NOT NULL
+    AND {{ m.window_lower('event_time') }}
+  GROUP BY 1, 2, 3
+),
+reads AS (
+  SELECT source_table_full_name AS tbl, COUNT(*) AS read_events
+  FROM {{ tbl('access','table_lineage') }}
+  WHERE source_table_full_name IS NOT NULL
+    AND {{ m.window_lower('event_time') }}
+  GROUP BY 1
+),
+-- lineage-availability sentinel. "Zero reads on THIS table" is only a
+-- meaningful "dead data" signal if lineage is capturing reads in the table's SCHEMA
+-- at all. A schema with NO captured reads of ANY table is "no coverage" (lineage
+-- isn't instrumented there), NOT evidence the data is dead — score() suppresses
+-- those rather than claiming an unread-output saving it cannot support. Schema =
+-- catalog.schema of the source table (full name is catalog.schema.table).
+read_schema AS (
+  SELECT
+    concat_ws('.', split(source_table_full_name, '[.]')[0],
+                   split(source_table_full_name, '[.]')[1]) AS sch,
+    COUNT(*) AS reads
+  FROM {{ tbl('access','table_lineage') }}
+  WHERE source_table_full_name IS NOT NULL
+    AND {{ m.window_lower('event_time') }}
+  GROUP BY 1
+),
+-- Per (job, table): is this output table unread, and does its SCHEMA show any
+-- captured reads (the sentinel)?
+job_table AS (
+  SELECT
+    w.workspace_id, w.job_id, w.tbl, w.write_events, w.last_write, w.first_write,
+    CASE WHEN COALESCE(r.read_events, 0) = 0 THEN 1 ELSE 0 END AS unread,
+    COALESCE(rs.reads, 0) AS schema_reads
+  FROM writes w
+  LEFT JOIN reads r ON w.tbl = r.tbl
+  LEFT JOIN read_schema rs
+    ON concat_ws('.', split(w.tbl, '[.]')[0], split(w.tbl, '[.]')[1]) = rs.sch
+),
+per_job AS (
+  SELECT
+    workspace_id,
+    job_id,
+    COUNT(*) AS n_tables,
+    SUM(unread) AS n_unread,
+    SUM(write_events) AS total_writes,
+    -- The weakest schema read-coverage across the job's output tables. score()
+    -- suppresses the job when this is 0 ("no coverage" — see read_schema).
+    MIN(schema_reads) AS min_schema_reads,
+    MAX(last_write) AS last_write,
+    MIN(first_write) AS first_write,
+    -- Days spanned between the first and last write to these tables. "Nobody has
+    -- read it" is only meaningful once the data has been sitting there long enough
+    -- for a reader to show up: a table first written yesterday is unread because
+    -- it is new, not because it is dead. score() suppresses rows below
+    -- min_observation_days (finops_rules.history).
+    DATEDIFF(MAX(last_write), MIN(first_write)) + 1 AS observed_days,
+    ANY_VALUE(tbl) AS sample_table
+  FROM job_table
+  GROUP BY 1, 2
+  HAVING COUNT(*) = SUM(unread)                 -- every output table unread
+     AND COUNT(*) <= {{ max_output_tables }}    -- focused producer, not a platform
+     AND SUM(write_events) >= {{ min_writes }}  -- recurring, not a one-off
+),
+-- Current job version: rank ALL versions, then keep the live one.
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }},
+{{ m.usage_cost_cte('job_cost', 'u.usage_metadata.job_id', 'job_id') }},
+-- Per-day write counts for the chart (reads are 0 by construction).
+daily AS (
+  SELECT
+    jt.workspace_id, jt.job_id,
+    CAST(w.event_time AS DATE) AS d,
+    COUNT(*) AS writes
+  FROM {{ tbl('access','table_lineage') }} w
+  JOIN per_job jt
+    ON w.workspace_id = jt.workspace_id AND w.entity_id = CAST(jt.job_id AS STRING)
+  WHERE w.entity_type = 'JOB' AND w.target_type = 'TABLE'
+    AND {{ m.window_lower('w.event_time') }}
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT workspace_id, job_id,
+    transform(
+      array_sort(collect_list(struct(d AS d, writes AS w)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'w', x.w, 'r', 0)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+)
+SELECT
+  pj.workspace_id,
+  pj.job_id,
+  lj.job_name,
+  pj.n_tables,
+  pj.total_writes,
+  pj.observed_days,
+  pj.min_schema_reads,
+  pj.sample_table,
+  CAST(pj.last_write AS STRING) AS last_write,
+  COALESCE(jc.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(jc.dbus_30d, 0) AS dbus_30d,
+  COALESCE(jc.unpriced_dbus, 0) AS unpriced_dbus,
+  da.days{{ m.contract_cost_select('jc', lead=True) }}
+FROM per_job pj
+LEFT JOIN latest_jobs lj USING (workspace_id, job_id)
+LEFT JOIN job_cost jc USING (workspace_id, job_id)
+LEFT JOIN daily_arr da USING (workspace_id, job_id)
+WHERE COALESCE(jc.cost_30d_usd, 0) > 0

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment-specific outputs from the deployment notebook
+src/brickpulse/rules/config/thresholds.yaml.orig
+
+# OS
+.DS_Store
+
+# Development and build artifacts
+node_modules/
+.pytest_cache/
+.ruff_cache/
+.uv-cache/
+*.egg-info/
+dist/
+release/
+build/
+.env*
+.databricks/
+.impeccable/review/
+playwright-report/
+test-results/
+
+# Local agent settings
+.claude/settings.local.json

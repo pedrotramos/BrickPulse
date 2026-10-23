@@ -1,0 +1,293 @@
+{% import '_macros.sql.j2' as m with context %}
+{% set target_min = target_autostop_minutes | default(10) %}
+{% set target_sec = target_min * 60 %}
+{#- evidence.savings_curve (plan F.2, PR F1b): the same counterfactual at each
+    candidate auto-stop ABOVE the target, so "Saved so far" can value a partial move
+    (240 -> 30 when we proposed 10). The target comes first; score() drops values at
+    or above the warehouse's current setting. Pure SUM()s over busy_gaps: no extra
+    scan of any table. -#}
+{% set curve_minutes = [target_min] %}
+{% for cm in (savings_curve_minutes | default([10, 15, 20, 30, 45, 60, 90, 120])) %}
+{% if cm > target_min and cm not in curve_minutes %}{% set _ = curve_minutes.append(cm) %}{% endif %}
+{% endfor %}
+-- Rule: warehouse_autostop  (the savings rebuild)
+-- Candidate SQL warehouses whose auto-stop is missing, zero, or longer than the
+-- acceptable threshold. The avoidable idle warm-pool is priced from EXACT
+-- intervals, not billed-hour buckets:
+--   * running_seconds  — how long the cluster was actually UP, reconstructed from
+--     system.compute.warehouse_events (the ground-truth warm time, replacing the
+--     old "a billed hour == a warm hour" approximation).
+--   * merged_busy_seconds — union of query.history intervals, so two concurrent
+--     queries count their shared warm time ONCE (no duplicate warm from parallelism).
+--   * counterfactual_warm_seconds — what the warm time WOULD be under a
+--     {{ target_autostop_minutes | default(10) }}-minute auto-stop: each merged busy
+--     run plus at most that many idle seconds after it (head gaps never warm the
+--     cluster because it only starts on a query; the final run keeps one capped tail).
+-- reclaimable_seconds = running - min(counterfactual, running); score() prices it
+-- from the corrected hourly cost via warehouse_autostop_savings_from_gaps, whose
+-- fraction (reclaim / running) is capped at 1 so reclaimed $ never exceed the
+-- warehouse's corrected cost.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py).
+WITH latest_warehouses AS (
+  -- Current version per warehouse. Portable rank-then-filter rather than QUALIFY:
+  -- QUALIFY is a DBSQL extension that open-source Spark does not parse, and the
+  -- hermetic sample-data gate runs the rule SQL on Spark. Selection is unchanged
+  -- (rn=1 by change_time DESC).
+  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type,
+         warehouse_size, auto_stop_minutes
+  FROM (
+    SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type,
+           warehouse_size, auto_stop_minutes,
+           ROW_NUMBER() OVER (
+             PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','warehouses') }}
+  )
+  WHERE rn = 1
+),
+candidates AS (
+  SELECT *
+  FROM latest_warehouses
+  -- Serverless warehouses scale to zero and bill per-second of actual compute,
+  -- so there is no idle warm-pool for a shorter auto-stop to reclaim. Only
+  -- CLASSIC/PRO warehouses hold a warm cluster between queries.
+  WHERE warehouse_type <> 'SERVERLESS'
+    AND (
+      auto_stop_minutes IS NULL
+      OR auto_stop_minutes = 0
+      OR auto_stop_minutes > {{ max_acceptable_minutes }}
+    )
+),
+-- ============================ ACTUAL RUNNING TIME ==========================
+-- Reconstruct how long each candidate was UP from warehouse_events. Each event
+-- sets a state (cluster_count >= 1 => warm) that holds until the NEXT event, so
+-- summing (next_event - this_event) over the "up" segments gives real warm time.
+-- every join carries workspace_id (warehouse_id is unique only within a
+-- workspace).
+carry_in AS (
+  -- State as of the window's opening edge: the last event BEFORE the window. A
+  -- warehouse already running when the window opens must count from the edge, or
+  -- running_seconds would be understated and the reclaim fraction overstated.
+  SELECT workspace_id, warehouse_id, is_up
+  FROM (
+    SELECT e.workspace_id, e.warehouse_id, (e.cluster_count >= 1) AS is_up,
+           ROW_NUMBER() OVER (
+             PARTITION BY e.workspace_id, e.warehouse_id ORDER BY e.event_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','warehouse_events') }} e
+    JOIN candidates c
+      ON c.workspace_id = e.workspace_id AND c.warehouse_id = e.warehouse_id
+    WHERE e.event_time < current_timestamp() - INTERVAL 14 DAYS
+  )
+  WHERE rn = 1
+),
+run_events AS (
+  SELECT e.workspace_id, e.warehouse_id, e.event_time, (e.cluster_count >= 1) AS is_up
+  FROM {{ tbl('compute','warehouse_events') }} e
+  JOIN candidates c
+    ON c.workspace_id = e.workspace_id AND c.warehouse_id = e.warehouse_id
+  WHERE e.event_time >= current_timestamp() - INTERVAL 14 DAYS
+  UNION ALL
+  SELECT workspace_id, warehouse_id,
+         current_timestamp() - INTERVAL 14 DAYS AS event_time, is_up
+  FROM carry_in
+),
+run_seg AS (
+  SELECT workspace_id, warehouse_id, event_time, is_up,
+         LEAD(event_time) OVER (
+           PARTITION BY workspace_id, warehouse_id ORDER BY event_time
+         ) AS next_time
+  FROM run_events
+),
+running AS (
+  SELECT workspace_id, warehouse_id,
+         SUM(CASE WHEN is_up
+                  THEN GREATEST(0, timestampdiff(SECOND,
+                         event_time,
+                         LEAST(COALESCE(next_time, current_timestamp()),
+                               current_timestamp())))
+                  ELSE 0 END) AS running_seconds
+  FROM run_seg
+  GROUP BY 1, 2
+),
+-- ============================ MERGED BUSY TIME ============================
+-- Union of query.history intervals per (workspace, warehouse). Overlapping /
+-- adjacent queries collapse into one island, so concurrency never inflates warm
+-- time. Classic gaps-and-islands: a query starts a NEW island only when it begins
+-- after the running max end of all earlier queries.
+q_intervals AS (
+  SELECT c.workspace_id, c.warehouse_id, qh.start_time, qh.end_time
+  FROM candidates c
+  JOIN {{ tbl('query','history') }} qh
+    ON qh.workspace_id = c.workspace_id
+   AND qh.compute.warehouse_id = c.warehouse_id
+   AND qh.start_time >= current_timestamp() - INTERVAL 14 DAYS
+),
+q_marked AS (
+  SELECT workspace_id, warehouse_id, start_time, end_time,
+         CASE WHEN start_time > MAX(end_time) OVER (
+                     PARTITION BY workspace_id, warehouse_id
+                     ORDER BY start_time, end_time
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+              THEN 1 ELSE 0 END AS new_island
+  FROM q_intervals
+),
+q_island AS (
+  SELECT workspace_id, warehouse_id, start_time, end_time,
+         SUM(new_island) OVER (
+           PARTITION BY workspace_id, warehouse_id
+           ORDER BY start_time, end_time
+           ROWS UNBOUNDED PRECEDING) AS island
+  FROM q_marked
+),
+busy AS (  -- one row per merged busy interval
+  SELECT workspace_id, warehouse_id, island,
+         MIN(start_time) AS busy_start, MAX(end_time) AS busy_end
+  FROM q_island
+  GROUP BY 1, 2, 3
+),
+busy_gaps AS (
+  SELECT workspace_id, warehouse_id, busy_start, busy_end,
+         timestampdiff(SECOND, busy_start, busy_end) AS busy_sec,
+         timestampdiff(SECOND, busy_end,
+           LEAD(busy_start) OVER (
+             PARTITION BY workspace_id, warehouse_id ORDER BY busy_start)
+         ) AS gap_to_next_sec
+  FROM busy
+),
+counterfactual AS (
+  SELECT workspace_id, warehouse_id,
+         SUM(busy_sec) AS merged_busy_seconds,
+         -- warm under the target auto-stop: each busy run plus at most target_sec
+         -- of trailing idle before it stops (COALESCE handles the final run's
+         -- open tail, LEAST caps every gap at the target).
+         SUM(busy_sec + LEAST(COALESCE(gap_to_next_sec, {{ target_sec }}), {{ target_sec }}))
+           AS counterfactual_warm_seconds{% for cm in curve_minutes %},
+         -- savings curve: the same counterfactual under a {{ cm }}-minute auto-stop
+         SUM(busy_sec + LEAST(COALESCE(gap_to_next_sec, {{ cm * 60 }}), {{ cm * 60 }}))
+           AS cf_warm_seconds_{{ cm }}{% endfor %}
+  FROM busy_gaps
+  GROUP BY 1, 2
+),
+-- ============================ COST / VIZ / HISTORY ========================
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'warehouse_id') }},
+-- 14-day hourly spine for the DISPLAY heatmap only (0=stopped 1=active 2=warm).
+-- The priced reclaim comes from the interval math above, not this rollup.
+hours AS (
+  SELECT explode(sequence(
+    date_trunc('HOUR', current_timestamp() - INTERVAL 14 DAYS),
+    date_trunc('HOUR', current_timestamp()) - INTERVAL 1 HOUR,
+    INTERVAL 1 HOUR
+  )) AS h
+),
+warm AS (  -- hours the warehouse was billed (=> up / warm)
+  SELECT workspace_id,
+         usage_metadata.warehouse_id AS warehouse_id,
+         date_trunc('HOUR', usage_start_time) AS h
+  FROM {{ tbl('billing','usage') }}
+  WHERE usage_metadata.warehouse_id IS NOT NULL
+    AND usage_start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2, 3
+),
+active AS (  -- hours the warehouse actually served a query
+  SELECT workspace_id,
+         compute.warehouse_id AS warehouse_id,
+         date_trunc('HOUR', start_time) AS h
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2, 3
+),
+grid AS (
+  SELECT c.workspace_id, c.warehouse_id, hh.h,
+         CASE WHEN act.warehouse_id IS NOT NULL THEN 1
+              WHEN wm.warehouse_id IS NOT NULL THEN 2
+              ELSE 0 END AS state
+  FROM candidates c
+  CROSS JOIN hours hh
+  LEFT JOIN warm wm    ON wm.workspace_id = c.workspace_id AND wm.warehouse_id = c.warehouse_id AND wm.h = hh.h
+  LEFT JOIN active act ON act.workspace_id = c.workspace_id AND act.warehouse_id = c.warehouse_id AND act.h = hh.h
+),
+series AS (
+  SELECT workspace_id, warehouse_id,
+         transform(
+           array_sort(collect_list(struct(h AS h, state AS state)),
+                      (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END),
+           x -> x.state
+         ) AS hourly_states,
+         -- First hour of the series, so the heatmap can align rows to UTC days.
+         MIN(h) AS grid_start
+  FROM grid
+  GROUP BY 1, 2
+),
+-- Distinct days this warehouse actually served queries. The reclaimable idle tail
+-- is a property of the warehouse's usage RHYTHM, which a single day's queries
+-- can't establish, so score() suppresses rows below min_observation_days
+-- (finops_rules.history). Measured on query.history — the same source the busy
+-- intervals read — so the sample size and the priced evidence always agree.
+observed AS (
+  SELECT c.workspace_id, c.warehouse_id,
+         COUNT(DISTINCT CAST(qh.start_time AS DATE)) AS observed_days
+  FROM candidates c
+  JOIN {{ tbl('query','history') }} qh
+    ON qh.workspace_id = c.workspace_id
+   AND qh.compute.warehouse_id = c.warehouse_id
+   AND qh.start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2
+)
+SELECT
+  c.workspace_id,
+  c.warehouse_id,
+  c.warehouse_name,
+  c.warehouse_size,
+  c.auto_stop_minutes,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('cost') }}{{ m.cloud_cost_select() }}
+  series.hourly_states,
+  series.grid_start,
+  -- Interval-derived warm/reclaim. warm_minutes is the ACTUAL running
+  -- time from warehouse_events, so score()'s reclaim/warm fraction is bounded by 1
+  -- and reclaimed $ can never exceed the warehouse's corrected cost.
+  running.running_seconds / 60.0 AS warm_minutes,
+  running.running_seconds / 60.0 AS running_minutes,
+  COALESCE(counterfactual.merged_busy_seconds, 0) / 60.0 AS merged_busy_minutes,
+  LEAST(COALESCE(counterfactual.counterfactual_warm_seconds, 0),
+        running.running_seconds) / 60.0 AS counterfactual_warm_minutes,
+  GREATEST(0,
+    running.running_seconds
+      - LEAST(COALESCE(counterfactual.counterfactual_warm_seconds, 0),
+              running.running_seconds)) / 60.0 AS reclaimable_minutes,
+  -- evidence.savings_curve inputs: reclaimable minutes at each candidate auto-stop,
+  -- aligned with curve_minutes (first entry = the target, so it equals
+  -- reclaimable_minutes). Same arithmetic as reclaimable_minutes.
+  array({{ curve_minutes | join(', ') }}) AS curve_minutes,
+  array({% for cm in curve_minutes %}{{ ',' if not loop.first }}
+    CAST(GREATEST(0,
+      running.running_seconds
+        - LEAST(COALESCE(counterfactual.cf_warm_seconds_{{ cm }}, 0),
+                running.running_seconds)) / 60.0 AS DOUBLE){% endfor %}
+  ) AS curve_reclaimable_minutes,
+  COALESCE(observed.observed_days, 0) AS observed_days
+FROM candidates c
+LEFT JOIN cost USING (workspace_id, warehouse_id){{ m.cloud_cost_join('cloud_cost', 'c', 'warehouse_id') }}
+LEFT JOIN series USING (workspace_id, warehouse_id)
+LEFT JOIN running USING (workspace_id, warehouse_id)
+LEFT JOIN counterfactual USING (workspace_id, warehouse_id)
+LEFT JOIN observed USING (workspace_id, warehouse_id)

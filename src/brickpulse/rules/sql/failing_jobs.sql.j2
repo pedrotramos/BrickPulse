@@ -1,0 +1,210 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: failing_jobs  (Gap G1 — reliability waste)
+-- Jobs that fail a large share of their runs are burning compute on work that
+-- produces nothing: the cluster spins up, the task runs until it raises, and
+-- those DBUs are billed anyway. We measure that waste directly.
+--
+-- METHODOLOGY (measured, per-run, not estimated):
+--   * Terminal runs come from system.lakeflow.job_run_timeline (run_type =
+--     'JOB_RUN'; SUBMIT/WORKFLOW one-offs excluded — they are not the recurring
+--     pipelines this rule targets). A run is "failed" if its result_state is a
+--     terminal error state: ERROR, FAILED or TIMED_OUT.
+--
+--     VERIFIED VOCABULARY (live, 30 days). result_state takes exactly six values:
+--     SUCCEEDED, ERROR, FAILED, TIMED_OUT, CANCELLED, SKIPPED. Two earlier entries
+--     in this list could never match anything:
+--       - `TIMEDOUT` was a misspelling of `TIMED_OUT`, so timed-out runs were
+--         counted as SUCCESSES and every affected job's failure rate read low.
+--       - `INTERNAL_ERROR` / `MAXIMUM_CONCURRENT_RUNS_REACHED` are
+--         `termination_code` values, not result_states (the real codes are
+--         INTERNAL_ERROR and MAX_CONCURRENT_RUNS_EXCEEDED). Their runs already
+--         arrive as ERROR / SKIPPED, so they are covered by the state check.
+--
+--     CANCELLED is NOT counted as a failure (usually a deliberate stop, not broken
+--     code), and SKIPPED is not either — a skipped run consumed no compute, so
+--     there is no wasted spend to reclaim.
+--   * REAL cost is attributed per run by joining billing.usage on
+--     usage_metadata.job_run_id (populated for serverless + jobs-compute), priced
+--     with list_prices. failed_cost_30d is the exact billed spend on failed runs.
+--   * Per-day SUCCEEDED/FAILED counts are collected for the chart.
+--   * Streaming jobs are EXCLUDED: a job whose runs are majority CONTINUOUS
+--     (trigger_type) runs a streaming query forever and restarts on error by
+--     design, so its error terminations are normal, not reclaimable waste. Verified
+--     across many accounts (30d): continuous jobs are ~3% of otherwise-
+--     flagged jobs but ~half of credited savings, almost all of it spurious.
+--   score() scales the measured failed-run spend by how far the failure rate
+--   exceeds a healthy baseline, so a job at noise-level failure is credited ~$0,
+--   then nets out the compute a fixed run still consumes once it succeeds.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer so this same SQL serves account-wide precompute and workspace-
+-- scoped live queries.
+WITH terminal AS (  -- one row per terminal run, with its calendar day + failed flag
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    CAST(MAX(period_end_time) AS DATE) AS run_day,
+    MAX(CASE
+      WHEN result_state IN ('ERROR', 'FAILED', 'TIMED_OUT') THEN 1 ELSE 0 END) AS failed,
+    -- Cancellations and skips, kept SEPARATE from failures. Neither is broken code,
+    -- but a job cancelled constantly is still burning compute on work nobody keeps,
+    -- and the counts make that visible instead of invisible.
+    MAX(CASE WHEN result_state = 'CANCELLED' THEN 1 ELSE 0 END) AS cancelled,
+    MAX(CASE WHEN result_state = 'SKIPPED' THEN 1 ELSE 0 END) AS skipped,
+    -- Continuous/streaming runs. A continuous job runs a streaming query forever and
+    -- RESTARTS on error by design, so its error terminations are normal operation,
+    -- not reclaimable waste. trigger_type = 'CONTINUOUS' marks them (verified live
+    -- vocabulary: CRON, ONETIME, CONTINUOUS, PERIODIC, FILE_ARRIVAL, TABLE,
+    -- ONETIME_RETRY, MODEL). Jobs that are majority-continuous are dropped below.
+    MAX(CASE WHEN trigger_type = 'CONTINUOUS' THEN 1 ELSE 0 END) AS is_continuous,
+    -- The dominant reason this job ends badly. CLUSTER_ERROR points at
+    -- infrastructure/config; RUN_EXECUTION_ERROR at the code — a different fix, so
+    -- worth naming in the finding rather than making the reader go look.
+    MAX(termination_code) AS termination_code
+  FROM {{ tbl('lakeflow','job_run_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    AND run_type = 'JOB_RUN'
+    AND result_state IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+-- Current job version: rank ALL versions, then keep the live one.
+-- Filtering delete_time before ranking would resurrect an older version of a
+-- since-deleted job.
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }},
+run_cost AS (  -- real billed cost per individual run, priced via list_prices
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.job_id AS job_id,
+    u.usage_metadata.job_run_id AS run_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.job_run_id IS NOT NULL
+  GROUP BY 1, 2, 3
+){% if contract_prices %},
+-- Contract-rate ratios per JOB (price_basis): run_cost's per-run grain can't carry a
+-- ratio through per_job's SUMs, so it is measured once at the job grain instead.
+job_contract AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.job_id AS job_id{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.job_run_id IS NOT NULL
+  GROUP BY 1, 2
+){% endif %},
+-- Join each terminal run to its cost, so cost carries the failed flag + day.
+run_priced AS (
+  SELECT
+    t.workspace_id, t.job_id, t.run_day, t.failed,
+    t.cancelled, t.skipped, t.is_continuous, t.termination_code,
+    COALESCE(rc.usd, 0.0) AS usd
+  FROM terminal t
+  LEFT JOIN run_cost rc
+    ON CAST(t.job_id AS STRING) = rc.job_id
+   AND CAST(t.run_id AS STRING) = rc.run_id
+),
+per_job AS (
+  SELECT
+    workspace_id,
+    job_id,
+    COUNT(*) AS total_runs,
+    -- Distinct days with terminal runs. A burst of failures inside one day is
+    -- usually one incident (a bad deploy, an upstream outage) rather than the
+    -- chronic pattern this rule targets, so score() suppresses rows below
+    -- min_observation_days (finops_rules.history).
+    COUNT(DISTINCT run_day) AS observed_days,
+    SUM(failed) AS failed_runs,
+    -- Reliability signals kept separate from the failure rate, because each implies
+    -- a different fix: cancellations are usually operational (a person or a
+    -- concurrency limit stopping work), failures are usually code or config.
+    SUM(cancelled) AS cancelled_runs,
+    SUM(skipped) AS skipped_runs,
+    -- Continuous-triggered runs, reported so the raw table shows a job was kept
+    -- (minority-continuous) or would explain why a streaming job is absent.
+    SUM(is_continuous) AS continuous_runs,
+    -- Cancelled runs DO consume compute up to the moment they stop, so their spend
+    -- is reported. It is deliberately NOT added to the savings estimate: stopping a
+    -- job someone deliberately cancels is not an action this rule can recommend.
+    SUM(CASE WHEN cancelled = 1 THEN usd ELSE 0 END) AS cancelled_cost_30d,
+    -- The most common termination code, for the "why did it end" line.
+    MAX(termination_code) AS termination_code,
+    -- NOTE: SKIPPED runs stay in this denominator. They consumed no compute, so
+    -- excluding them would RAISE every affected job's fail_rate and therefore the
+    -- credited savings — the wrong direction for an engine whose estimates must
+    -- never exceed true avoidable spend. Skips are rare (2 runs across the verified
+    -- account) and are reported separately above.
+    SUM(failed) / COUNT(*) AS fail_rate,
+    SUM(CASE WHEN failed = 1 THEN usd ELSE 0 END) AS failed_cost_30d,
+    -- Successful runs and their spend, needed to price the "fixed" state: a
+    -- recovered failure does not vanish, it becomes a SUCCESSFUL run that still
+    -- bills compute. score() nets the mean successful-run cost out of the credited
+    -- savings, so the estimate reflects fixing the job (the feasible action) rather
+    -- than retiring it. A run is successful only if it neither failed, was
+    -- cancelled, nor skipped (the six result_states are mutually exclusive).
+    SUM(CASE WHEN failed = 0 AND cancelled = 0 AND skipped = 0 THEN 1 ELSE 0 END)
+      AS succeeded_runs,
+    SUM(CASE WHEN failed = 0 AND cancelled = 0 AND skipped = 0 THEN usd ELSE 0 END)
+      AS succeeded_cost_30d,
+    SUM(usd) AS total_cost_30d
+  FROM run_priced
+  GROUP BY 1, 2
+  -- Recurring only, and only jobs with a real cluster of failures — a single
+  -- fluke on a low-volume job is not a reliability problem worth surfacing.
+  -- Streaming jobs are excluded: a job whose runs are majority CONTINUOUS restarts
+  -- on error by design, so its failures are not reclaimable waste (option A).
+  HAVING COUNT(*) >= {{ min_runs }}
+     AND SUM(failed) >= {{ min_failures }}
+     AND SUM(is_continuous) / COUNT(*) <= {{ max_continuous_run_share }}
+),
+-- Per-day outcome buckets for the chart (only for jobs that qualified).
+daily AS (
+  SELECT
+    rp.workspace_id, rp.job_id, rp.run_day,
+    SUM(CASE WHEN rp.failed = 0 THEN 1 ELSE 0 END) AS succeeded,
+    SUM(rp.failed) AS failed
+  FROM run_priced rp
+  JOIN per_job pj USING (workspace_id, job_id)
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, job_id,
+    transform(
+      array_sort(collect_list(struct(run_day AS d, succeeded AS s, failed AS f)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 's', x.s, 'f', x.f)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+)
+SELECT
+  pj.workspace_id,
+  pj.job_id,
+  lj.job_name,
+  pj.total_runs,
+  pj.observed_days,
+  pj.failed_runs,
+  ROUND(pj.fail_rate, 4) AS fail_rate,
+  pj.cancelled_runs,
+  pj.skipped_runs,
+  pj.succeeded_runs,
+  pj.continuous_runs,
+  pj.termination_code,
+  ROUND(pj.cancelled_cost_30d, 4) AS cancelled_cost_30d,
+  ROUND(pj.failed_cost_30d, 4) AS failed_cost_30d,
+  ROUND(pj.succeeded_cost_30d, 4) AS succeeded_cost_30d,
+  ROUND(pj.total_cost_30d, 4) AS cost_30d_usd,
+  da.days{{ m.contract_cost_select('jcp', lead=True) }}
+FROM per_job pj
+LEFT JOIN latest_jobs lj USING (workspace_id, job_id)
+LEFT JOIN daily_arr da USING (workspace_id, job_id){% if contract_prices %}
+LEFT JOIN job_contract jcp
+  ON jcp.workspace_id = pj.workspace_id AND jcp.job_id = CAST(pj.job_id AS STRING){% endif %}

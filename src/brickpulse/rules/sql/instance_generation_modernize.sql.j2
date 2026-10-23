@@ -1,0 +1,307 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: instance_generation_modernize  (Tier 2, C6 — experimental / Labs)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on each cluster's billed usage).
+--   units:           per-node-minute node types from system.compute.node_timeline
+--                    (its `node_type` column is populated; billing.usage_metadata.node_type
+--                    mostly is not), weighted by cores from compute.node_types.
+--   counterfactual:  the same work on the current-generation family that replaces the
+--                    old one (config/instance_generations.yaml). The $ figure is the
+--                    spend ON old-generation nodes (addressable), not a saving: the new
+--                    type's VM price is not in system tables, and its DBU rate is known
+--                    only when this account has billed it.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      old-generation spend <= the resource's corrected cost; closed-open
+--                    window; coverage-guarded.
+--
+-- Resource grain. An all-purpose cluster (UI/API) is its own resource. Job and pipeline
+-- clusters are ephemeral (a new cluster_id per run), so their node minutes and cost
+-- roll up to the JOB or PIPELINE that owns the cluster config — that is where the node
+-- type is changed. The owner comes from billing.usage_metadata (job_id /
+-- dlt_pipeline_id); cluster_source decides which one counts, because a job run on an
+-- all-purpose cluster also carries a job_id.
+--
+-- Cost split per node type: a cluster's cost x (that type's core-minutes / the
+-- cluster's core-minutes). Driver and workers of different types are split fairly.
+--
+-- DBU rate per node type is MEASURED like allpurpose_shape_mismatch does it: for
+-- homogeneous clusters (driver type = worker type) and cluster-hours with a constant
+-- node set (node-minutes = nodes x 60), DBUs billed that hour / nodes, taken across
+-- the account, kept when stable (p25..p75 within rate_spread_max of the median) over
+-- >= min_rate_clusters clusters.
+--
+-- The two regexes (old_gen_regex / target_gen_regex) are rendered from the YAML
+-- mapping by the rule's render_sql; the SQL only narrows the candidate set, the
+-- Python re-applies the mapping entry by entry to pick each target.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH cluster_meta AS (
+  -- Latest row per cluster WITHOUT the delete filter: job/pipeline clusters are
+  -- terminated and deleted after each run, but we still need their source.
+  SELECT workspace_id, cluster_id, cluster_name, cluster_source, dbr_version, delete_time
+  FROM (
+    SELECT workspace_id, cluster_id, cluster_name, cluster_source, dbr_version, delete_time,
+           ROW_NUMBER() OVER (
+             PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','clusters') }}
+  )
+  WHERE rn = 1
+),
+node_types AS (  -- dedupe node-type specs (per-account/region rows)
+  SELECT node_type, MAX(core_count) AS core_count, MAX(memory_mb) AS memory_mb,
+         MAX(COALESCE(gpu_count, 0)) AS gpu_count
+  FROM {{ tbl('compute','node_types') }}
+  GROUP BY node_type
+),
+cluster_type_minutes AS (  -- node-minutes per (cluster, node type)
+  SELECT
+    n.workspace_id, n.cluster_id, n.node_type,
+    COUNT(*) AS node_minutes,
+    SUM(CASE WHEN n.driver THEN 1 ELSE 0 END) AS driver_node_minutes,
+    COUNT(*) * COALESCE(MAX(nt.core_count), 1) AS core_minutes
+  FROM {{ tbl('compute','node_timeline') }} n
+  LEFT JOIN node_types nt ON nt.node_type = n.node_type
+  WHERE {{ m.window_lower('n.start_time') }}
+    AND n.node_type IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+cluster_days AS (
+  SELECT DISTINCT workspace_id, cluster_id, CAST(start_time AS DATE) AS d
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time') }}
+),
+cluster_billing AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    MAX(u.usage_metadata.job_id) AS job_id,
+    MAX(u.usage_metadata.dlt_pipeline_id) AS pipeline_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    MAX(CASE WHEN u.sku_name LIKE '%PHOTON%' THEN 1 ELSE 0 END) AS photon
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+cluster_resource AS (  -- which resource owns each billed cluster
+  SELECT
+    b.workspace_id, b.cluster_id, b.cost_30d_usd, b.dbus_30d, b.unpriced_dbus, b.photon,
+    cm.dbr_version,
+    CASE
+      WHEN cm.cluster_source = 'JOB' AND b.job_id IS NOT NULL THEN 'job'
+      WHEN cm.cluster_source IN ('PIPELINE', 'PIPELINE_MAINTENANCE')
+           AND b.pipeline_id IS NOT NULL THEN 'pipeline'
+      WHEN cm.cluster_source IN ('UI', 'API') AND cm.delete_time IS NULL THEN 'cluster'
+    END AS resource_kind,
+    CASE
+      WHEN cm.cluster_source = 'JOB' THEN b.job_id
+      WHEN cm.cluster_source IN ('PIPELINE', 'PIPELINE_MAINTENANCE') THEN b.pipeline_id
+      ELSE b.cluster_id
+    END AS resource_id,
+    cm.cluster_name,
+    cm.cluster_source
+  FROM cluster_billing b
+  JOIN cluster_meta cm USING (workspace_id, cluster_id)
+),
+cluster_totals AS (
+  SELECT workspace_id, cluster_id, SUM(core_minutes) AS cluster_core_minutes
+  FROM cluster_type_minutes
+  GROUP BY 1, 2
+),
+old_type_cost AS (  -- old-generation node types per cluster, with their cost share
+  SELECT
+    cr.workspace_id, cr.resource_kind, cr.resource_id, ctm.node_type,
+    SUM(ctm.node_minutes) AS node_minutes,
+    SUM(ctm.driver_node_minutes) AS driver_node_minutes,
+    SUM(ctm.core_minutes) AS core_minutes,
+    SUM(cr.cost_30d_usd * ctm.core_minutes / ct.cluster_core_minutes) AS cost_30d_usd,
+    MAX(cr.photon) AS photon
+  FROM cluster_type_minutes ctm
+  JOIN cluster_totals ct USING (workspace_id, cluster_id)
+  JOIN cluster_resource cr USING (workspace_id, cluster_id)
+  WHERE cr.resource_kind IS NOT NULL
+    AND ct.cluster_core_minutes > 0
+    AND ctm.node_type RLIKE '{{ old_gen_regex }}'
+  GROUP BY 1, 2, 3, 4
+),
+resource_totals AS (
+  SELECT
+    cr.workspace_id, cr.resource_kind, cr.resource_id,
+    SUM(cr.cost_30d_usd) AS cost_30d_usd,
+    SUM(cr.dbus_30d) AS dbus_30d,
+    SUM(cr.unpriced_dbus) AS unpriced_dbus,
+    MAX(cr.photon) AS photon,
+    COUNT(DISTINCT cr.cluster_id) AS clusters,
+    collect_set(cr.dbr_version) AS dbr_versions,
+    MAX(cr.cluster_name) AS cluster_name,
+    MAX(cr.cluster_source) AS cluster_source
+  FROM cluster_resource cr
+  WHERE cr.resource_kind IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+resource_days AS (  -- distinct days the resource ran (finops_rules.history guard)
+  SELECT cr.workspace_id, cr.resource_kind, cr.resource_id,
+         COUNT(DISTINCT cd.d) AS observed_days
+  FROM cluster_resource cr
+  JOIN cluster_days cd USING (workspace_id, cluster_id)
+  WHERE cr.resource_kind IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+-- ======================= OBSERVED DBU / NODE-HOUR per node type ==================
+homogeneous AS (
+  SELECT workspace_id, cluster_id, worker_node_type AS node_type
+  FROM (
+    SELECT workspace_id, cluster_id, worker_node_type, driver_node_type,
+           ROW_NUMBER() OVER (
+             PARTITION BY workspace_id, cluster_id ORDER BY change_time DESC
+           ) AS rn
+    FROM {{ tbl('compute','clusters') }}
+  )
+  WHERE rn = 1 AND worker_node_type = driver_node_type
+),
+node_hours AS (
+  SELECT n.workspace_id, n.cluster_id, date_trunc('HOUR', n.start_time) AS h,
+         COUNT(*) AS node_minutes, COUNT(DISTINCT n.instance_id) AS nodes
+  FROM {{ tbl('compute','node_timeline') }} n
+  JOIN homogeneous hc USING (workspace_id, cluster_id)
+  WHERE {{ m.window_lower('n.start_time') }}
+  GROUP BY 1, 2, 3
+),
+billed_hours AS (
+  SELECT workspace_id, usage_metadata.cluster_id AS cluster_id,
+         date_trunc('HOUR', usage_start_time) AS h,
+         MAX(CASE WHEN sku_name LIKE '%PHOTON%' THEN 1 ELSE 0 END) AS photon,
+         SUM(usage_quantity) AS dbus
+  FROM {{ tbl('billing','usage') }}
+  WHERE {{ m.window_lower('usage_date') }}
+    AND usage_metadata.cluster_id IS NOT NULL
+    AND usage_unit = 'DBU'
+  GROUP BY 1, 2, 3
+),
+node_rates AS (
+  SELECT node_type, photon, rate AS dbu_per_node_hour
+  FROM (
+    SELECT hc.node_type, bh.photon,
+           COUNT(DISTINCT hc.cluster_id) AS clusters,
+           percentile_approx(bh.dbus / nh.nodes, 0.5) AS rate,
+           percentile_approx(bh.dbus / nh.nodes, 0.25) AS p25,
+           percentile_approx(bh.dbus / nh.nodes, 0.75) AS p75
+    FROM homogeneous hc
+    JOIN node_hours nh USING (workspace_id, cluster_id)
+    JOIN billed_hours bh USING (workspace_id, cluster_id, h)
+    WHERE nh.node_minutes = nh.nodes * 60  -- constant node set for the whole hour
+      AND bh.dbus > 0
+    GROUP BY 1, 2
+  )
+  WHERE clusters >= {{ min_rate_clusters }}
+    AND rate > 0
+    AND p75 - p25 <= {{ rate_spread_max }} * rate
+),
+rates_by_type AS (
+  SELECT node_type,
+         MAX(CASE WHEN photon = 0 THEN dbu_per_node_hour END) AS rate_std,
+         MAX(CASE WHEN photon = 1 THEN dbu_per_node_hour END) AS rate_photon
+  FROM node_rates
+  GROUP BY node_type
+),
+old_types AS (SELECT DISTINCT node_type FROM old_type_cost),
+-- Same-core, similar-memory, non-GPU current-generation types for every old type in
+-- use. Python picks the target per mapping entry.
+alternatives AS (
+  SELECT
+    ot.node_type AS for_node_type,
+    alt.node_type,
+    alt.memory_mb,
+    r.rate_std,
+    r.rate_photon
+  FROM old_types ot
+  JOIN node_types cur ON cur.node_type = ot.node_type
+  JOIN node_types alt
+    ON alt.core_count = cur.core_count
+   AND alt.gpu_count = 0
+   AND alt.memory_mb >= {{ min_memory_ratio }} * cur.memory_mb
+   AND alt.memory_mb <= {{ max_memory_ratio }} * cur.memory_mb
+   AND alt.node_type RLIKE '{{ target_gen_regex }}'
+  LEFT JOIN rates_by_type r ON r.node_type = alt.node_type
+),
+resource_old AS (
+  SELECT
+    o.workspace_id, o.resource_kind, o.resource_id,
+    SUM(o.cost_30d_usd) AS old_gen_cost_30d_usd,
+    SUM(o.core_minutes) AS old_gen_core_minutes,
+    collect_list(named_struct(
+      'node_type', o.node_type,
+      'node_minutes', o.node_minutes,
+      'driver_node_minutes', o.driver_node_minutes,
+      'core_count', nt.core_count,
+      'memory_mb', nt.memory_mb,
+      'cost_30d_usd', o.cost_30d_usd,
+      'rate_std', r.rate_std,
+      'rate_photon', r.rate_photon)) AS old_node_types
+  FROM old_type_cost o
+  LEFT JOIN node_types nt ON nt.node_type = o.node_type
+  LEFT JOIN rates_by_type r ON r.node_type = o.node_type
+  GROUP BY 1, 2, 3
+),
+resource_alts AS (
+  SELECT o.workspace_id, o.resource_kind, o.resource_id,
+         collect_list(named_struct(
+           'for_node_type', a.for_node_type,
+           'node_type', a.node_type,
+           'memory_mb', a.memory_mb,
+           'rate_std', a.rate_std,
+           'rate_photon', a.rate_photon)) AS alt_node_types
+  FROM (SELECT DISTINCT workspace_id, resource_kind, resource_id, node_type FROM old_type_cost) o
+  JOIN alternatives a ON a.for_node_type = o.node_type
+  GROUP BY 1, 2, 3
+),
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }},
+{{ m.latest_scd_cte(
+     'latest_pipelines',
+     tbl('lakeflow','pipelines'),
+     'workspace_id, pipeline_id',
+     select_cols='workspace_id, pipeline_id, name AS pipeline_name, delete_time') }}
+SELECT
+  ro.workspace_id,
+  ro.resource_kind,
+  ro.resource_id,
+  CASE ro.resource_kind
+    WHEN 'job' THEN j.job_name
+    WHEN 'pipeline' THEN p.pipeline_name
+    ELSE rt.cluster_name
+  END AS resource_name,
+  rt.cluster_source,
+  rt.clusters,
+  rt.dbr_versions,
+  rd.observed_days,
+  COALESCE(rt.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(rt.dbus_30d, 0) AS dbus_30d,
+  COALESCE(rt.unpriced_dbus, 0) AS unpriced_dbus,
+  COALESCE(rt.photon, 0) AS photon,
+  ro.old_gen_cost_30d_usd,
+  ro.old_gen_core_minutes,
+  ro.old_node_types,
+  ra.alt_node_types
+FROM resource_old ro
+JOIN resource_totals rt USING (workspace_id, resource_kind, resource_id)
+JOIN resource_days rd USING (workspace_id, resource_kind, resource_id)
+LEFT JOIN resource_alts ra USING (workspace_id, resource_kind, resource_id)
+LEFT JOIN latest_jobs j
+  ON ro.resource_kind = 'job' AND j.workspace_id = ro.workspace_id AND j.job_id = ro.resource_id
+LEFT JOIN latest_pipelines p
+  ON ro.resource_kind = 'pipeline' AND p.workspace_id = ro.workspace_id
+ AND p.pipeline_id = ro.resource_id
+-- A job / pipeline that no longer exists has nothing to reconfigure.
+WHERE (ro.resource_kind = 'cluster'
+       OR (ro.resource_kind = 'job' AND j.job_id IS NOT NULL)
+       OR (ro.resource_kind = 'pipeline' AND p.pipeline_id IS NOT NULL))
+  AND COALESCE(rt.cost_30d_usd, 0) > 0

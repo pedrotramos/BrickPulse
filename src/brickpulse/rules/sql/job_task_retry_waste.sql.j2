@@ -1,0 +1,227 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: job_task_retry_waste  (Tier 1, B3 — retries hidden inside successful runs)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the job run's usage)
+--   units:           task-attempt wall-seconds; dollars = the job RUN's billed cost
+--                    apportioned by the failed attempts' share of the run's task
+--                    wall-time.
+--   counterfactual:  a task that fails and is RETRIED by the job's retry policy, then
+--                    succeeds, billed compute for every failed attempt. The run ends
+--                    SUCCEEDED, so failing_jobs never sees it. Fixing the flaky cause
+--                    (a transient source, an OOM, a race) removes those attempts; the
+--                    final successful attempt still runs, so only the FAILED attempts
+--                    are reclaimable.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      retry cost <= the run's billed cost (a share in [0,1] of it);
+--                    closed-open window; coverage-guarded.
+--
+-- HOW RETRIES APPEAR (verified live 2026-09-23, 30 days):
+--   * job_task_run_timeline has NO attempt-number column. Each attempt of a task is
+--     its own task run_id under the same (job_run_id, task_key), and the attempts
+--     run SEQUENTIALLY (next attempt starts within ~10 min of the previous end).
+--   * for_each iterations ALSO share (job_run_id, task_key) with distinct run_ids,
+--     but they run CONCURRENTLY and carry parent_run_id <> job_run_id (the for_each
+--     task's run). Counting them as retries would flag every for_each job, so only
+--     top-level task runs (parent_run_id = job_run_id) are considered.
+--   * result_state is only populated on the attempt's final hourly slice; MAX() over
+--     the slices recovers it.
+--   * billing.usage.usage_metadata.job_run_id is the JOB run id (0 of 69k attempt
+--     run_ids matched it; 99% of job_run_ids did), so cost exists per job run only
+--     and is apportioned to attempts by wall-time.
+--
+-- Only job runs that END SUCCEEDED are counted: a run that finally failed is priced
+-- in full by failing_jobs, so excluding it here keeps the two rules disjoint.
+-- Streaming (majority-CONTINUOUS) jobs are excluded as in failing_jobs.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH task_attempt AS (  -- one row per top-level task attempt (hourly slices collapsed)
+  SELECT
+    workspace_id,
+    job_id,
+    job_run_id,
+    task_key,
+    run_id,
+    MAX(result_state) AS result_state,
+    MAX(termination_code) AS termination_code,
+    MIN(period_start_time) AS attempt_start,
+    GREATEST(
+      unix_timestamp(MAX(period_end_time)) - unix_timestamp(MIN(period_start_time)), 0
+    ) AS dur_s
+  FROM {{ tbl('lakeflow','job_task_run_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    -- top-level task runs only: for_each iterations point at the for_each task run
+    AND parent_run_id = job_run_id
+  GROUP BY 1, 2, 3, 4, 5
+),
+ranked AS (  -- attempt order within a (job run, task); rn_desc = 1 is the final attempt
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY workspace_id, job_run_id, task_key ORDER BY attempt_start DESC
+    ) AS rn_desc
+  FROM task_attempt
+),
+task_final AS (  -- per (job run, task): did it succeed in the end, and after how many failures
+  SELECT
+    workspace_id,
+    job_id,
+    job_run_id,
+    task_key,
+    MAX(CASE WHEN rn_desc = 1 THEN result_state END) AS final_state,
+    SUM(CASE WHEN rn_desc > 1 AND result_state IN ('FAILED', 'ERROR', 'TIMED_OUT')
+             THEN 1 ELSE 0 END) AS failed_attempts,
+    SUM(CASE WHEN rn_desc > 1 AND result_state IN ('FAILED', 'ERROR', 'TIMED_OUT')
+             THEN dur_s ELSE 0 END) AS failed_dur_s,
+    MAX(CASE WHEN rn_desc = 2 THEN termination_code END) AS last_failure_code,
+    SUM(dur_s) AS task_dur_s
+  FROM ranked
+  GROUP BY 1, 2, 3, 4
+),
+run_tasks AS (  -- per job run: failed-attempt wall-time vs all task wall-time
+  SELECT
+    workspace_id,
+    job_id,
+    job_run_id,
+    SUM(CASE WHEN final_state = 'SUCCEEDED' THEN failed_attempts ELSE 0 END) AS failed_attempts,
+    SUM(CASE WHEN final_state = 'SUCCEEDED' THEN failed_dur_s ELSE 0 END) AS failed_dur_s,
+    SUM(task_dur_s) AS task_dur_s,
+    -- the task that retried most in this run, for the "which task" line
+    max_by(CASE WHEN final_state = 'SUCCEEDED' AND failed_attempts > 0 THEN task_key END,
+           CASE WHEN final_state = 'SUCCEEDED' THEN failed_attempts ELSE 0 END) AS top_task_key,
+    max_by(CASE WHEN final_state = 'SUCCEEDED' AND failed_attempts > 0 THEN last_failure_code END,
+           CASE WHEN final_state = 'SUCCEEDED' THEN failed_attempts ELSE 0 END) AS top_failure_code
+  FROM task_final
+  GROUP BY 1, 2, 3
+),
+job_run AS (  -- job-level outcome per run (only SUCCEEDED runs are this rule's scope)
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    CAST(MAX(period_end_time) AS DATE) AS run_day,
+    MAX(result_state) AS result_state,
+    MAX(CASE WHEN trigger_type = 'CONTINUOUS' THEN 1 ELSE 0 END) AS is_continuous
+  FROM {{ tbl('lakeflow','job_run_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    AND run_type = 'JOB_RUN'
+    AND result_state IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+run_cost AS (  -- real billed cost per job run, priced via list_prices
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.job_id AS job_id,
+    u.usage_metadata.job_run_id AS run_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.job_run_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+run_priced AS (
+  SELECT
+    jr.workspace_id,
+    jr.job_id,
+    jr.run_id,
+    jr.run_day,
+    jr.is_continuous,
+    COALESCE(rt.failed_attempts, 0) AS failed_attempts,
+    rt.top_task_key,
+    rt.top_failure_code,
+    COALESCE(rc.usd, 0.0) AS usd,
+    COALESCE(rc.dbus, 0.0) AS dbus,
+    COALESCE(rc.unpriced_dbus, 0.0) AS unpriced_dbus,
+    -- the failed attempts' share of the run's task wall-time, capped to [0, 1]
+    CASE WHEN COALESCE(rt.task_dur_s, 0) > 0
+         THEN LEAST(1.0, GREATEST(0.0, rt.failed_dur_s / rt.task_dur_s))
+         ELSE 0.0 END AS retry_share
+  FROM job_run jr
+  LEFT JOIN run_tasks rt
+    ON rt.workspace_id = jr.workspace_id
+   AND CAST(rt.job_id AS STRING) = CAST(jr.job_id AS STRING)
+   AND CAST(rt.job_run_id AS STRING) = CAST(jr.run_id AS STRING)
+  LEFT JOIN run_cost rc
+    ON rc.workspace_id = jr.workspace_id
+   AND rc.job_id = CAST(jr.job_id AS STRING)
+   AND rc.run_id = CAST(jr.run_id AS STRING)
+  WHERE jr.result_state = 'SUCCEEDED'
+),
+per_job_day AS (  -- per day first, so the chart and the totals share one pass
+  SELECT
+    workspace_id,
+    job_id,
+    run_day,
+    COUNT(*) AS succeeded_runs,
+    SUM(CASE WHEN failed_attempts > 0 THEN 1 ELSE 0 END) AS retried_runs,
+    SUM(failed_attempts) AS failed_attempts,
+    SUM(usd * retry_share) AS retry_cost,
+    SUM(usd) AS cost_usd,
+    SUM(dbus) AS dbus,
+    SUM(unpriced_dbus) AS unpriced_dbus,
+    SUM(is_continuous) AS continuous_runs,
+    max_by(top_task_key, failed_attempts) AS top_task_key,
+    max_by(top_failure_code, failed_attempts) AS top_failure_code,
+    MAX(failed_attempts) AS max_failed_attempts
+  FROM run_priced
+  GROUP BY 1, 2, 3
+),
+per_job AS (
+  SELECT
+    workspace_id,
+    job_id,
+    SUM(succeeded_runs) AS succeeded_runs,
+    -- Distinct days with successful runs: the sample the retry rate is measured on.
+    COUNT(*) AS observed_days,
+    SUM(retried_runs) AS retried_runs,
+    -- Distinct days a retry happened: one bad afternoon is an incident, not a pattern.
+    SUM(CASE WHEN retried_runs > 0 THEN 1 ELSE 0 END) AS retry_days,
+    SUM(failed_attempts) AS failed_attempts,
+    SUM(retry_cost) AS retry_cost_30d,
+    SUM(cost_usd) AS cost_30d_usd,
+    SUM(dbus) AS dbus_30d,
+    SUM(unpriced_dbus) AS unpriced_dbus,
+    SUM(continuous_runs) AS continuous_runs,
+    max_by(top_task_key, max_failed_attempts) AS top_task_key,
+    max_by(top_failure_code, max_failed_attempts) AS top_failure_code,
+    -- per-day clean (c) vs retried (r) successful runs, for the chart
+    transform(
+      array_sort(collect_list(struct(run_day AS d, succeeded_runs AS s, retried_runs AS r)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'c', x.s - x.r, 'r', x.r)
+    ) AS days
+  FROM per_job_day
+  GROUP BY 1, 2
+  HAVING SUM(succeeded_runs) >= {{ min_runs }}
+     AND SUM(retried_runs) >= {{ min_retried_runs }}
+     AND SUM(continuous_runs) / SUM(succeeded_runs) <= {{ max_continuous_run_share }}
+),
+-- Current job version: rank ALL versions, then keep the live one.
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }}
+SELECT
+  pj.workspace_id,
+  pj.job_id,
+  lj.job_name,
+  pj.succeeded_runs,
+  pj.observed_days,
+  pj.retried_runs,
+  pj.retry_days,
+  pj.failed_attempts,
+  ROUND(pj.retried_runs / pj.succeeded_runs, 4) AS retry_rate,
+  ROUND(pj.retry_cost_30d, 4) AS retry_cost_30d,
+  ROUND(pj.cost_30d_usd, 4) AS cost_30d_usd,
+  pj.dbus_30d,
+  pj.unpriced_dbus,
+  pj.continuous_runs,
+  pj.top_task_key,
+  pj.top_failure_code,
+  pj.days
+FROM per_job pj
+LEFT JOIN latest_jobs lj USING (workspace_id, job_id)

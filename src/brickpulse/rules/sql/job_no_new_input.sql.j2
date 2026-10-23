@@ -1,0 +1,285 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: job_no_new_input  (Tier 2, C7 — scheduled runs whose upstream didn't change)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the job run's usage)
+--   units:           job runs; dollars = billed cost of the no-new-input runs.
+--   counterfactual:  a job on a cron schedule re-runs whether or not anything it
+--                    reads has changed. A run where NO source table had a write
+--                    since the job's previous successful run recomputes the same
+--                    answer. A table-update (or file-arrival) trigger runs it only
+--                    when an input changed, so those runs would not happen.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      no-new-input cost <= the job's scheduled-run cost; closed-open
+--                    window; coverage-guarded.
+--
+-- HOW LINEAGE IS READ (verified live 2026-09-23, 30 days;
+-- table_lineage is ~95M rows / 30 d, so everything is pre-aggregated first):
+--   * Reads: entity_type='JOB' rows, entity_id = job_id, entity_run_id = job_run_id.
+--     source_type in TABLE / STREAMING_TABLE / MATERIALIZED_VIEW are the tables whose
+--     writes we can see. A VIEW read is expanded: ~90% of runs that read a view also
+--     log the base tables with direct_access = false, so indirect rows are kept.
+--   * source_path is populated for ordinary TABLE reads too (the storage location),
+--     so "path read" means source_type = 'PATH' (or a path with no table name).
+--   * Writes: target_table_full_name, BY ANY ENTITY (jobs, pipelines, notebooks,
+--     warehouses, or NULL entity). Pipeline writes carry no source (24M rows).
+--   * Some tables are written OUTSIDE lineage and never show a write: system.* tables
+--     (Databricks writes them) and serving / AI Gateway inference tables
+--     (<prefix>_payload*, written by the endpoint). Verified: a job reading
+--     system.access.audit + system.serving.* showed 100% "no new input". The SQL
+--     flags both; score() suppresses them, and flags other never-written sources.
+--   * Tables the job itself writes are dropped from its source set: a MERGE reads
+--     its own target, and the job's own write would otherwise count as "new input".
+--   * Table names are keyed with metastore_id (a catalog name can repeat across
+--     regional metastores).
+--   * Writes are bucketed per (table, hour). The check is conservative both ways: a
+--     write in hour H counts as "after the previous run" if H + 1h > prev start,
+--     and as "before this run" if H <= this start.
+--
+-- Only CRON / PERIODIC triggered, SUCCEEDED job runs are evaluated (TABLE and
+-- FILE_ARRIVAL jobs already trigger on input; failed runs belong to failing_jobs).
+-- A run with no previous successful run in the window is not evaluated.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH job_run AS (  -- one row per scheduled job run (hourly slices collapsed)
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    MIN(period_start_time) AS run_start,
+    MAX(result_state) AS result_state
+  FROM {{ tbl('lakeflow','job_run_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    AND run_type = 'JOB_RUN'
+    AND trigger_type IN ('CRON', 'PERIODIC')
+  GROUP BY 1, 2, 3
+),
+ok_run AS (  -- successful scheduled runs, with the previous successful run's start
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    run_start,
+    LAG(run_start) OVER (PARTITION BY workspace_id, job_id ORDER BY run_start) AS prev_start
+  FROM job_run
+  WHERE result_state = 'SUCCEEDED'
+),
+sched_job AS (
+  SELECT workspace_id, job_id, COUNT(*) AS ok_runs
+  FROM ok_run
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= {{ min_runs }}
+),
+job_lineage AS (  -- the job's lineage rows, pre-aggregated per (job, run, source)
+  SELECT
+    l.workspace_id,
+    l.entity_id AS job_id,
+    l.entity_run_id AS run_id,
+    l.metastore_id,
+    l.source_table_full_name AS src,
+    l.source_type,
+    l.source_path,
+    l.direct_access,
+    l.target_table_full_name AS tgt
+  FROM {{ tbl('access','table_lineage') }} l
+  JOIN sched_job sj
+    ON sj.workspace_id = l.workspace_id AND CAST(sj.job_id AS STRING) = l.entity_id
+  WHERE {{ m.window_lower('l.event_time') }}
+    AND l.entity_type = 'JOB'
+),
+job_flags AS (  -- per job: can lineage see everything it reads?
+  SELECT
+    workspace_id,
+    job_id,
+    COUNT(DISTINCT run_id) AS lineage_runs,
+    MAX(CASE WHEN source_type = 'PATH'
+               OR (source_table_full_name_null AND source_path IS NOT NULL)
+             THEN 1 ELSE 0 END) AS has_path_read,
+    MAX(CASE WHEN source_type IN ('VIEW', 'METRIC_VIEW') THEN 1 ELSE 0 END) AS has_view_read,
+    MAX(CASE WHEN direct_access = false THEN 1 ELSE 0 END) AS has_indirect_read
+  FROM (SELECT *, src IS NULL AS source_table_full_name_null FROM job_lineage)
+  GROUP BY 1, 2
+),
+job_targets AS (
+  SELECT DISTINCT workspace_id, job_id, metastore_id, tgt
+  FROM job_lineage
+  WHERE tgt IS NOT NULL
+),
+job_src AS (  -- distinct observable source tables, minus the job's own targets
+  SELECT DISTINCT s.workspace_id, s.job_id, s.metastore_id, s.src
+  FROM job_lineage s
+  LEFT ANTI JOIN job_targets t
+    ON t.workspace_id = s.workspace_id AND t.job_id = s.job_id
+   AND t.metastore_id = s.metastore_id AND t.tgt = s.src
+  WHERE s.src IS NOT NULL
+    AND s.source_type IN ('TABLE', 'STREAMING_TABLE', 'MATERIALIZED_VIEW')
+),
+src_tables AS (
+  SELECT DISTINCT metastore_id, src FROM job_src
+),
+table_write_hour AS (  -- writes by anyone, only to tables some candidate job reads
+  SELECT DISTINCT
+    w.metastore_id,
+    w.target_table_full_name AS tbl,
+    date_trunc('HOUR', w.event_time) AS write_hour
+  FROM {{ tbl('access','table_lineage') }} w
+  JOIN src_tables st
+    ON st.metastore_id = w.metastore_id AND st.src = w.target_table_full_name
+  WHERE {{ m.window_lower('w.event_time') }}
+    AND w.target_table_full_name IS NOT NULL
+),
+job_write_hour AS (  -- the union of write hours across a job's sources
+  SELECT DISTINCT js.workspace_id, js.job_id, tw.write_hour
+  FROM job_src js
+  JOIN table_write_hour tw ON tw.metastore_id = js.metastore_id AND tw.tbl = js.src
+),
+events AS (  -- runs and write hours on one timeline per job (writes sort first)
+  SELECT r.workspace_id, CAST(r.job_id AS STRING) AS job_id, r.run_start AS ts, 0 AS is_run,
+         CAST(NULL AS TIMESTAMP) AS write_hour,
+         CAST(r.run_id AS STRING) AS run_id, r.prev_start
+  FROM ok_run r
+  -- jobs with no observable source table are not evaluable (score() would suppress
+  -- them anyway); dropping them here keeps the timeline small
+  LEFT SEMI JOIN (SELECT DISTINCT workspace_id, job_id FROM job_src) j
+    ON j.workspace_id = r.workspace_id AND j.job_id = CAST(r.job_id AS STRING)
+  UNION ALL
+  SELECT workspace_id, job_id, write_hour AS ts, -1 AS is_run, write_hour,
+         CAST(NULL AS STRING) AS run_id, CAST(NULL AS TIMESTAMP) AS prev_start
+  FROM job_write_hour
+),
+carried AS (  -- latest source write hour at or before each run's start
+  SELECT
+    *,
+    LAST_VALUE(write_hour, true) OVER (
+      PARTITION BY workspace_id, job_id ORDER BY ts, is_run
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS last_write_hour
+  FROM events
+),
+run_eval AS (
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    run_start,
+    CASE WHEN last_write_hour IS NULL
+           OR last_write_hour + INTERVAL 1 HOUR <= prev_start
+         THEN 1 ELSE 0 END AS no_new_input
+  FROM (SELECT *, ts AS run_start FROM carried WHERE is_run = 0 AND prev_start IS NOT NULL)
+),
+run_cost AS (  -- real billed cost per job run, priced via list_prices
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.job_id AS job_id,
+    u.usage_metadata.job_run_id AS run_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.job_run_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+per_job_day AS (  -- per day first, so the chart and the totals share one pass
+  SELECT
+    re.workspace_id,
+    re.job_id,
+    CAST(re.run_start AS DATE) AS day,
+    COUNT(*) AS runs,
+    SUM(re.no_new_input) AS no_new_input_runs,
+    SUM(CASE WHEN re.no_new_input = 1 THEN COALESCE(rc.usd, 0.0) ELSE 0.0 END)
+      AS no_new_input_cost,
+    SUM(COALESCE(rc.usd, 0.0)) AS cost_usd,
+    SUM(COALESCE(rc.dbus, 0.0)) AS dbus,
+    SUM(COALESCE(rc.unpriced_dbus, 0.0)) AS unpriced_dbus,
+    MAX(CASE WHEN re.no_new_input = 0 THEN re.run_start END) AS last_new_input_run
+  FROM run_eval re
+  LEFT JOIN run_cost rc
+    ON rc.workspace_id = re.workspace_id
+   AND rc.job_id = re.job_id
+   AND rc.run_id = re.run_id
+  GROUP BY 1, 2, 3
+),
+per_job AS (
+  SELECT
+    workspace_id,
+    job_id,
+    SUM(runs) AS evaluated_runs,
+    COUNT(*) AS observed_days,
+    SUM(no_new_input_runs) AS no_new_input_runs,
+    SUM(CASE WHEN no_new_input_runs > 0 THEN 1 ELSE 0 END) AS no_new_input_days,
+    SUM(no_new_input_cost) AS no_new_input_cost_30d,
+    SUM(cost_usd) AS cost_30d_usd,
+    SUM(dbus) AS dbus_30d,
+    SUM(unpriced_dbus) AS unpriced_dbus,
+    CAST(MAX(last_new_input_run) AS STRING) AS last_new_input_run,
+    -- per-day runs with (n) and without (z) new input, for the chart
+    transform(
+      array_sort(collect_list(struct(day AS d, runs AS r, no_new_input_runs AS z)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'n', x.r - x.z, 'z', x.z)
+    ) AS days
+  FROM per_job_day
+  GROUP BY 1, 2
+  HAVING SUM(no_new_input_runs) >= {{ min_no_new_input_runs }}
+),
+src_summary AS (
+  SELECT
+    js.workspace_id,
+    js.job_id,
+    COUNT(*) AS n_sources,
+    -- sources with no visible write in the whole window: static, or written outside
+    -- lineage (the external-writer blind spot, surfaced in score())
+    SUM(CASE WHEN tw.n_hours IS NULL THEN 1 ELSE 0 END) AS n_sources_unwritten,
+    slice(array_sort(collect_list(CASE WHEN tw.n_hours IS NULL THEN js.src END)), 1, 5)
+      AS unwritten_sources,
+    -- sources that are ALWAYS written outside lineage: system tables (Databricks
+    -- writes them) and serving / AI Gateway inference tables (<prefix>_payload*,
+    -- written by the endpoint). score() suppresses jobs reading either.
+    MAX(CASE WHEN split(js.src, '[.]')[0] = 'system' THEN 1 ELSE 0 END) AS has_system_source,
+    MAX(CASE WHEN split(js.src, '[.]')[2] RLIKE '_payload($|_)' THEN 1 ELSE 0 END)
+      AS has_inference_source,
+    slice(array_sort(collect_list(js.src)), 1, 5) AS sample_sources
+  FROM job_src js
+  LEFT JOIN (
+    SELECT metastore_id, tbl, COUNT(*) AS n_hours FROM table_write_hour GROUP BY 1, 2
+  ) tw ON tw.metastore_id = js.metastore_id AND tw.tbl = js.src
+  GROUP BY 1, 2
+),
+-- Current job version: rank ALL versions, then keep the live one.
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }}
+SELECT
+  pj.workspace_id,
+  pj.job_id,
+  lj.job_name,
+  pj.evaluated_runs,
+  pj.observed_days,
+  pj.no_new_input_runs,
+  pj.no_new_input_days,
+  ROUND(pj.no_new_input_cost_30d, 4) AS no_new_input_cost_30d,
+  ROUND(pj.cost_30d_usd, 4) AS cost_30d_usd,
+  pj.dbus_30d,
+  pj.unpriced_dbus,
+  pj.last_new_input_run,
+  pj.days,
+  COALESCE(jf.lineage_runs, 0) AS lineage_runs,
+  COALESCE(jf.has_path_read, 0) AS has_path_read,
+  COALESCE(jf.has_view_read, 0) AS has_view_read,
+  COALESCE(jf.has_indirect_read, 0) AS has_indirect_read,
+  COALESCE(ss.n_sources, 0) AS n_sources,
+  COALESCE(ss.n_sources_unwritten, 0) AS n_sources_unwritten,
+  ss.unwritten_sources,
+  COALESCE(ss.has_system_source, 0) AS has_system_source,
+  COALESCE(ss.has_inference_source, 0) AS has_inference_source,
+  ss.sample_sources
+FROM per_job pj
+LEFT JOIN job_flags jf ON jf.workspace_id = pj.workspace_id AND jf.job_id = pj.job_id
+LEFT JOIN src_summary ss ON ss.workspace_id = pj.workspace_id AND ss.job_id = pj.job_id
+LEFT JOIN latest_jobs lj
+  ON lj.workspace_id = pj.workspace_id AND CAST(lj.job_id AS STRING) = pj.job_id
+WHERE pj.no_new_input_cost_30d > 0

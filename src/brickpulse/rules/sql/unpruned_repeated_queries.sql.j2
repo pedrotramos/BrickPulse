@@ -1,0 +1,172 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: unpruned_repeated_queries
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate, via the canonical price_join)
+--   units:           Spark task-milliseconds (slot occupancy) per query SHAPE; dollars =
+--                    the shape's share of the warehouse's task time x the warehouse's
+--                    corrected cost. Same apportioning as sql_repeated_failures.
+--   counterfactual:  none is modelled. A shape that repeats many times while scanning
+--                    ~every file it touches (no file pruning), or an identical query that
+--                    never hits the result cache, is spend a layout change (liquid
+--                    clustering, a materialized view) or a deterministic rewrite could
+--                    cut — but by an unknown factor. So the figure is "$ spent on this
+--                    query shape", an ADDRESSABLE upper bound, not a saving.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      Σ shape task_ms <= warehouse task_ms, so addressable <= corrected
+--                    warehouse cost; closed-open window; coverage-guarded.
+--
+-- FINGERPRINT (what "the same query" means). statement_text is often fully
+-- '<REDACTED>' (every statement on the test account), so text alone cannot group:
+--   1. text       — readable text, normalized: string/number literals -> '?',
+--                   whitespace collapsed, lower-cased, hashed. `distinct_texts` counts the
+--                   exact texts behind one shape (1 = the identical query every time).
+--   2. sql_query  — query_source.sql_query_id (a saved query: same text, parameters may vary)
+--   3. alert      — query_source.alert_id (one alert = one query)
+--   4. dashboard  — query_source.dashboard_id (ALL datasets of one dashboard together —
+--                   good enough for "does this dashboard prune?", NOT for "identical")
+--   5. job        — query_source.job_info.job_id (all SQL statements of one job)
+-- A redacted statement with none of those ids is DROPPED, never pooled: grouping every
+-- redacted statement together would invent one giant "repeated query".
+--
+-- Only FINISHED SELECTs are shapes: failed statements belong to sql_repeated_failures,
+-- and writes (INSERT/MERGE) scan by design. Scan statistics exclude result-cache hits
+-- (a cache hit reads no files and would dilute the prune ratio).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH {{ m.latest_scd_cte(
+     'wh',
+     tbl('compute','warehouses'),
+     'workspace_id, warehouse_id',
+     select_cols='workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size, delete_time') }},
+hist AS (
+  SELECT
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    CAST(start_time AS DATE) AS day,
+    statement_type,
+    execution_status,
+    COALESCE(total_task_duration_ms, 0) AS task_ms,
+    COALESCE(from_result_cache, false) AS cached,
+    COALESCE(read_files, 0) AS read_files,
+    COALESCE(pruned_files, 0) AS pruned_files,
+    COALESCE(read_bytes, 0) AS read_bytes,
+    statement_text,
+    (statement_text IS NOT NULL AND trim(statement_text) <> ''
+      AND upper(trim(statement_text)) <> '<REDACTED>') AS text_ok,
+    query_source.sql_query_id AS sql_query_id,
+    query_source.alert_id AS alert_id,
+    query_source.dashboard_id AS dashboard_id,
+    query_source.job_info.job_id AS job_id
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND {{ m.window_lower('start_time') }}
+),
+wh_tot AS (  -- the warehouse's whole workload: the denominator for the $ share
+  SELECT workspace_id, warehouse_id,
+         SUM(task_ms) AS total_task_ms,
+         COUNT(*) AS queries,
+         COUNT(DISTINCT day) AS observed_days
+  FROM hist
+  GROUP BY 1, 2
+),
+sel AS (
+  SELECT h.*,
+    CASE WHEN text_ok THEN lower(regexp_replace(regexp_replace(regexp_replace(
+           statement_text, "'([^']|'')*'", '?'),
+           '\\b[0-9]+(\\.[0-9]+)?\\b', '?'),
+           '\\s+', ' ')) END AS norm
+  FROM hist h
+  WHERE execution_status = 'FINISHED' AND statement_type = 'SELECT'
+),
+keyed AS (
+  SELECT s.*,
+    CASE WHEN text_ok THEN 'text'
+         WHEN sql_query_id IS NOT NULL THEN 'sql_query'
+         WHEN alert_id IS NOT NULL THEN 'alert'
+         WHEN dashboard_id IS NOT NULL THEN 'dashboard'
+         WHEN job_id IS NOT NULL THEN 'job' END AS shape_kind,
+    CASE WHEN text_ok THEN substr(sha2(norm, 256), 1, 16)
+         ELSE COALESCE(sql_query_id, alert_id, dashboard_id, job_id) END AS shape_key
+  FROM sel s
+),
+shapes AS (
+  SELECT
+    workspace_id, warehouse_id, shape_kind, shape_key,
+    COUNT(*) AS executions,
+    COUNT(DISTINCT day) AS shape_days,
+    SUM(CASE WHEN cached THEN 1 ELSE 0 END) AS cache_hits,
+    SUM(CASE WHEN cached THEN 0 ELSE 1 END) AS scans,
+    SUM(CASE WHEN cached THEN 0 ELSE read_files END) AS read_files,
+    SUM(CASE WHEN cached THEN 0 ELSE pruned_files END) AS pruned_files,
+    SUM(CASE WHEN cached THEN 0 ELSE read_bytes END) AS read_bytes,
+    SUM(task_ms) AS task_ms,
+    COUNT(DISTINCT CASE WHEN text_ok THEN sha2(statement_text, 256) END) AS distinct_texts,
+    -- Literal-free normalized text (never the raw statement: literals can be data).
+    substr(MIN(norm), 1, 200) AS sample_text,
+    MAX(CASE WHEN norm RLIKE '(now|current_timestamp|current_date|getdate|rand|random|uuid|unix_timestamp)\\s*\\('
+               OR norm RLIKE '\\bcurrent_(timestamp|date)\\b'
+             THEN 1 ELSE 0 END) AS nondeterministic_text
+  FROM keyed
+  WHERE shape_kind IS NOT NULL
+  GROUP BY 1, 2, 3, 4
+  -- Cheap candidate prefilter; score() applies the real thresholds.
+  HAVING COUNT(*) >= {{ min_executions }}
+     AND COUNT(DISTINCT day) >= {{ min_shape_days }}
+     AND SUM(task_ms) > 0
+     AND (
+       SUM(CASE WHEN cached THEN 1 ELSE 0 END) = 0
+       OR SUM(CASE WHEN cached THEN 0 ELSE pruned_files END)
+          <= {{ max_prune_ratio }} * SUM(CASE WHEN cached THEN 0 ELSE read_files + pruned_files END)
+     )
+),
+shape_arr AS (
+  SELECT
+    workspace_id, warehouse_id,
+    slice(
+      array_sort(
+        collect_list(named_struct(
+          'kind', shape_kind, 'key', shape_key, 'executions', executions,
+          'shape_days', shape_days, 'cache_hits', cache_hits, 'scans', scans,
+          'read_files', read_files, 'pruned_files', pruned_files,
+          'read_bytes', read_bytes, 'task_ms', task_ms,
+          'distinct_texts', distinct_texts, 'sample_text', sample_text,
+          'nondeterministic_text', nondeterministic_text)),
+        (l, r) -> CASE WHEN l.task_ms > r.task_ms THEN -1
+                       WHEN l.task_ms < r.task_ms THEN 1 ELSE 0 END),
+      1, {{ max_shapes }}) AS shapes,
+    COUNT(*) AS candidate_shapes
+  FROM shapes
+  GROUP BY 1, 2
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+)
+SELECT
+  sa.workspace_id,
+  sa.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  t.queries,
+  t.observed_days,
+  t.total_task_ms,
+  sa.candidate_shapes,
+  sa.shapes,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus
+FROM shape_arr sa
+JOIN wh_tot t USING (workspace_id, warehouse_id)
+LEFT JOIN cost c USING (workspace_id, warehouse_id)
+LEFT JOIN wh w USING (workspace_id, warehouse_id)

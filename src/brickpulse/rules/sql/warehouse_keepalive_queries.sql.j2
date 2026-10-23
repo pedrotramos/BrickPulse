@@ -1,0 +1,219 @@
+{% import '_macros.sql.j2' as m with context %}
+{% set hd = history_days | default(14) %}
+-- Rule: warehouse_keepalive_queries
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate, via the canonical price_join)
+--   units:           billed warehouse HOURS (billing.usage bucketed by
+--                    date_trunc('HOUR', usage_start_time)), classified by what the
+--                    warehouse did in that hour from system.query.history.
+--   counterfactual:  a "keep-alive hour" is an hour the warehouse was BILLED in which
+--                    every statement was TRIVIAL (metadata / session statements, a
+--                    zero-task SELECT such as a result-cache hit or `SELECT 1`) and no
+--                    real statement was running. A BI tool or poller that issues such a
+--                    statement every few minutes resets the auto-stop timer, so the
+--                    warehouse never stops. warehouse_autostop* cannot see this — they
+--                    count the pings as busy time — and a shorter auto-stop does not
+--                    help, because the timer never expires. The fix is on the CLIENT.
+--                    Without the pings those hours are not billed, except the auto-stop
+--                    tail after the last real work: score() deducts one auto-stop tail
+--                    per contiguous run of keep-alive hours (keepalive_islands).
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      keepalive_cost <= window cost (a subset of the same billed hours);
+--                    closed-open {{ hd }}-day window on both query.history and billing;
+--                    coverage-guarded; a real statement covers EVERY hour it runs in
+--                    (start..end), so a long query spanning an hour boundary never
+--                    makes the next hour look trivial-only.
+--
+-- Only warehouses WITH auto-stop enabled (> 0) are candidates: with auto-stop off the
+-- warehouse never stops regardless of pings, and warehouse_autostop owns that finding.
+-- Serverless warehouses bill warm time the same way, so they are included.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH {{ m.latest_scd_cte(
+     'wh',
+     tbl('compute','warehouses'),
+     'workspace_id, warehouse_id',
+     select_cols='workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size, auto_stop_minutes, delete_time') }},
+candidates AS (
+  SELECT * FROM wh WHERE COALESCE(auto_stop_minutes, 0) > 0
+),
+q AS (  -- every statement on a candidate warehouse in the window, tagged trivial/real
+  SELECT
+    qh.workspace_id,
+    qh.compute.warehouse_id AS warehouse_id,
+    qh.start_time,
+    GREATEST(COALESCE(qh.end_time, qh.start_time), qh.start_time) AS end_time,
+    COALESCE(qh.client_application, 'unknown') AS client_application,
+    qh.executed_by,
+    COALESCE(qh.from_result_cache, false) AS from_result_cache,
+    CASE
+      WHEN qh.statement_type IS NULL THEN true
+      WHEN qh.statement_type IN ('SHOW', 'DESCRIBE', 'USE', 'SET', 'OTHER', 'EXPLAIN') THEN true
+      -- A SELECT that ran no tasks did no compute work: a result-cache hit, a
+      -- metadata probe, or a constant `SELECT 1` health check.
+      WHEN qh.statement_type = 'SELECT' AND COALESCE(qh.total_task_duration_ms, 0) = 0 THEN true
+      WHEN lower(qh.statement_text) RLIKE '^\\s*select\\s+1\\s*;?\\s*$' THEN true
+      ELSE false
+    END AS trivial
+  FROM {{ tbl('query','history') }} qh
+  JOIN candidates c
+    ON c.workspace_id = qh.workspace_id AND c.warehouse_id = qh.compute.warehouse_id
+  WHERE {{ m.window_lower('qh.start_time', hd) }}
+),
+real_hours AS (  -- every hour a REAL statement was running in (start..end inclusive)
+  SELECT DISTINCT workspace_id, warehouse_id, h
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           explode(sequence(date_trunc('HOUR', start_time), date_trunc('HOUR', end_time),
+                            INTERVAL 1 HOUR)) AS h
+    FROM q
+    WHERE NOT trivial
+  )
+),
+triv_hours AS (  -- hours that saw at least one trivial statement start
+  SELECT workspace_id, warehouse_id, date_trunc('HOUR', start_time) AS h,
+         COUNT(*) AS n_trivial,
+         SUM(CASE WHEN from_result_cache THEN 1 ELSE 0 END) AS n_cache
+  FROM q
+  WHERE trivial
+  GROUP BY 1, 2, 3
+),
+billed_hours AS (  -- corrected billed cost per warehouse-hour (all record_types summed)
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    date_trunc('HOUR', u.usage_start_time) AS h,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  JOIN candidates c
+    ON c.workspace_id = u.workspace_id AND c.warehouse_id = u.usage_metadata.warehouse_id
+  WHERE {{ m.window_lower('u.usage_date', hd) }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+hour_class AS (
+  SELECT
+    b.workspace_id, b.warehouse_id, b.h, b.cost_usd, b.dbus, b.unpriced,
+    COALESCE(t.n_trivial, 0) AS n_trivial,
+    COALESCE(t.n_cache, 0) AS n_cache,
+    (r.h IS NOT NULL) AS is_real,
+    (t.h IS NOT NULL AND r.h IS NULL) AS is_keepalive
+  FROM billed_hours b
+  LEFT JOIN triv_hours t
+    ON t.workspace_id = b.workspace_id AND t.warehouse_id = b.warehouse_id AND t.h = b.h
+  LEFT JOIN real_hours r
+    ON r.workspace_id = b.workspace_id AND r.warehouse_id = b.warehouse_id AND r.h = b.h
+),
+islands AS (  -- contiguous runs of keep-alive hours (each run pays one auto-stop tail anyway)
+  SELECT workspace_id, warehouse_id,
+         SUM(CASE WHEN prev_h IS NULL OR prev_h <> h - INTERVAL 1 HOUR THEN 1 ELSE 0 END)
+           AS keepalive_islands
+  FROM (
+    SELECT workspace_id, warehouse_id, h,
+           LAG(h) OVER (PARTITION BY workspace_id, warehouse_id ORDER BY h) AS prev_h
+    FROM hour_class
+    WHERE is_keepalive
+  )
+  GROUP BY 1, 2
+),
+per_wh AS (
+  SELECT
+    workspace_id, warehouse_id,
+    COUNT(*) AS billed_hours,
+    SUM(CASE WHEN is_real THEN 1 ELSE 0 END) AS real_hours,
+    SUM(CASE WHEN is_keepalive THEN 1 ELSE 0 END) AS keepalive_hours,
+    COUNT(DISTINCT CASE WHEN is_keepalive THEN CAST(h AS DATE) END) AS keepalive_days,
+    SUM(CASE WHEN is_keepalive THEN n_trivial ELSE 0 END) AS keepalive_statements,
+    SUM(CASE WHEN is_keepalive THEN n_cache ELSE 0 END) AS keepalive_cache_hits,
+    SUM(cost_usd) AS cost_window_usd,
+    SUM(CASE WHEN is_keepalive THEN cost_usd ELSE 0 END) AS keepalive_cost_usd,
+    SUM(dbus) AS dbus_30d,
+    SUM(unpriced) AS unpriced_dbus,
+    -- Distinct days the warehouse was billed: a keep-alive is a RHYTHM, which one
+    -- day cannot establish (finops_rules.history).
+    COUNT(DISTINCT CAST(h AS DATE)) AS observed_days
+  FROM hour_class
+  GROUP BY 1, 2
+  HAVING SUM(CASE WHEN is_keepalive THEN 1 ELSE 0 END) >= {{ min_keepalive_hours }}
+),
+-- Who sends the trivial statements in the keep-alive hours, so `how` can name the
+-- culprit client (e.g. "Tableau Server as svc_bi"). Top 3 by statement count.
+culprit_counts AS (
+  SELECT q.workspace_id, q.warehouse_id, q.client_application, q.executed_by,
+         COUNT(*) AS n
+  FROM q
+  JOIN hour_class hc
+    ON hc.workspace_id = q.workspace_id AND hc.warehouse_id = q.warehouse_id
+   AND hc.h = date_trunc('HOUR', q.start_time) AND hc.is_keepalive
+  JOIN per_wh p ON p.workspace_id = q.workspace_id AND p.warehouse_id = q.warehouse_id
+  WHERE q.trivial
+  GROUP BY 1, 2, 3, 4
+),
+culprits AS (
+  SELECT workspace_id, warehouse_id,
+         collect_list(named_struct('client', client_application, 'user', executed_by, 'n', n))
+           AS top_clients
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY n DESC) AS rn
+    FROM culprit_counts
+  )
+  WHERE rn <= 3
+  GROUP BY 1, 2
+),
+-- {{ hd }}-day hourly spine for the DISPLAY heatmap (0 = not billed, 1 = real work,
+-- 2 = billed but no real work — mostly the keep-alive hours). Candidates only.
+hours AS (
+  SELECT explode(sequence(
+    -- [today - hd days, today): the same closed-open window as window_lower().
+    CAST(current_date() AS TIMESTAMP) - INTERVAL {{ hd }} DAYS,
+    CAST(current_date() AS TIMESTAMP) - INTERVAL 1 HOUR,
+    INTERVAL 1 HOUR
+  )) AS h
+),
+series AS (
+  SELECT p.workspace_id, p.warehouse_id,
+         transform(
+           array_sort(
+             collect_list(struct(hh.h AS h,
+                                 CASE WHEN hc.h IS NULL THEN 0
+                                      WHEN hc.is_real THEN 1
+                                      ELSE 2 END AS state)),
+             (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END),
+           x -> x.state
+         ) AS hourly_states
+  FROM per_wh p
+  CROSS JOIN hours hh
+  LEFT JOIN hour_class hc
+    ON hc.workspace_id = p.workspace_id AND hc.warehouse_id = p.warehouse_id AND hc.h = hh.h
+  GROUP BY 1, 2
+)
+SELECT
+  c.workspace_id,
+  c.warehouse_id,
+  c.warehouse_name,
+  c.warehouse_type,
+  c.warehouse_size,
+  c.auto_stop_minutes,
+  p.billed_hours,
+  p.real_hours,
+  p.keepalive_hours,
+  p.keepalive_days,
+  COALESCE(i.keepalive_islands, 0) AS keepalive_islands,
+  p.keepalive_statements,
+  p.keepalive_cache_hits,
+  COALESCE(p.cost_window_usd, 0) AS cost_window_usd,
+  COALESCE(p.keepalive_cost_usd, 0) AS keepalive_cost_usd,
+  COALESCE(p.dbus_30d, 0) AS dbus_30d,
+  COALESCE(p.unpriced_dbus, 0) AS unpriced_dbus,
+  p.observed_days,
+  cu.top_clients,
+  s.hourly_states
+FROM per_wh p
+JOIN candidates c USING (workspace_id, warehouse_id)
+LEFT JOIN islands i USING (workspace_id, warehouse_id)
+LEFT JOIN culprits cu USING (workspace_id, warehouse_id)
+LEFT JOIN series s USING (workspace_id, warehouse_id)

@@ -1,0 +1,49 @@
+[project]
+name = "brickpulse"
+version = "0.1.0"
+description = "Evidence-led Databricks financial observability"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "databricks-sql-connector>=3.0",
+    "databricks-sdk>=0.20",
+    # Used directly by the Genie Conversation API proxy (services/genie_conversation).
+    # Already a transitive dep of databricks-sdk; pinned here so the import is explicit.
+    "requests>=2.28",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.28", "build>=1", "ruff>=0.11"]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+# The app and pipeline install the same src-layout package.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["brickpulse*"]
+
+# The rule engine loads these at runtime (Jinja SQL templates + threshold/effort
+# config), so they must ship inside the wheel, not just the .py files.
+[tool.setuptools.package-data]
+"brickpulse.rules" = ["sql/*.sql.j2", "config/*.yaml"]
+"brickpulse.server" = ["static/index.html", "static/assets/*", "static/*", "i18n/*.json"]
+"brickpulse.pipelines" = ["ddl/*.sql"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110

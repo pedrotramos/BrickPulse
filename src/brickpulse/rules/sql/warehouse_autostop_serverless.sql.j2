@@ -1,0 +1,261 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: warehouse_autostop_serverless
+-- Candidate SERVERLESS SQL warehouses whose auto-stop is missing, zero, or longer
+-- than the (short) acceptable threshold. Serverless warehouses bill per-second and
+-- start far faster than classic, so a shorter auto-stop reclaims the idle tail
+-- after each query — the population the classic warehouse_autostop rule
+-- deliberately excludes (it filters warehouse_type <> 'SERVERLESS').
+--
+-- We do NOT assume "shorter is always better". Instead we hand score() the
+-- warehouse's own INTER-QUERY GAP DISTRIBUTION, bucketed, so the Python side can
+-- pick a value in the usability-safe 5-10 min window that reclaims real idle
+-- without restarting the warehouse under its users' feet
+-- (savings.choose_serverless_autostop).
+--
+-- Emitted per warehouse:
+--   gap_hist_*        counts of idle gaps by length bucket (drives the choice + chart)
+--   warm_minutes      billed warm time under today's setting (prices the reclaim)
+--   query_count       queries in the window
+--   hourly_* / daily_ activity series so the UI can show WHEN the thing is used
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer (backend/finops/data/scoping.py).
+WITH latest_warehouses AS (
+  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type,
+         warehouse_size, auto_stop_minutes
+  FROM {{ tbl('compute','warehouses') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+  ) = 1
+),
+candidates AS (
+  SELECT *
+  FROM latest_warehouses
+  -- SERVERLESS only — this is the population the classic rule excludes.
+  WHERE warehouse_type = 'SERVERLESS'
+    AND (
+      auto_stop_minutes IS NULL
+      OR auto_stop_minutes = 0
+      OR auto_stop_minutes > {{ max_acceptable_minutes }}
+    )
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Per-query idle gaps (minute resolution). Joining candidates scopes the
+-- query.history scan to serverless candidates only.
+q AS (
+  SELECT c.workspace_id, c.warehouse_id,
+         COALESCE(NULLIF(c.auto_stop_minutes, 0), 100000) AS cur_stop_min,
+         qh.start_time,
+         qh.end_time,
+         -- partition per (workspace, warehouse); a bare warehouse_id
+         -- would interleave two workspaces' query streams into one gap sequence.
+         LEAD(qh.start_time) OVER (
+           PARTITION BY c.workspace_id, c.warehouse_id ORDER BY qh.start_time
+         ) AS next_start
+  FROM candidates c
+  JOIN {{ tbl('query','history') }} qh
+    ON qh.workspace_id = c.workspace_id
+   AND qh.compute.warehouse_id = c.warehouse_id
+   AND {{ m.window_lower('qh.start_time') }}
+),
+gaps AS (
+  SELECT workspace_id, warehouse_id, cur_stop_min,
+         GREATEST(0, timestampdiff(SECOND, end_time, next_start) / 60.0) AS gap_min,
+         timestampdiff(SECOND, start_time, end_time) / 60.0 AS dur_min
+  FROM q
+  WHERE next_start IS NOT NULL
+),
+-- The gap HISTOGRAM: how many idle gaps fall in each length band. score() walks
+-- these bands to weigh "idle reclaimed" against "extra cold starts introduced"
+-- for every candidate auto-stop value. Bounds bracket the 5-10 min decision
+-- window closely and coarsen beyond it (a 3h gap is reclaimed by any setting).
+gap_hist AS (
+  SELECT workspace_id, warehouse_id,
+         COUNT_IF(gap_min <= 1)                       AS gap_hist_1,
+         COUNT_IF(gap_min > 1  AND gap_min <= 2)      AS gap_hist_2,
+         COUNT_IF(gap_min > 2  AND gap_min <= 3)      AS gap_hist_3,
+         COUNT_IF(gap_min > 3  AND gap_min <= 4)      AS gap_hist_4,
+         COUNT_IF(gap_min > 4  AND gap_min <= 5)      AS gap_hist_5,
+         COUNT_IF(gap_min > 5  AND gap_min <= 6)      AS gap_hist_6,
+         COUNT_IF(gap_min > 6  AND gap_min <= 7)      AS gap_hist_7,
+         COUNT_IF(gap_min > 7  AND gap_min <= 8)      AS gap_hist_8,
+         COUNT_IF(gap_min > 8  AND gap_min <= 9)      AS gap_hist_9,
+         COUNT_IF(gap_min > 9  AND gap_min <= 10)     AS gap_hist_10,
+         COUNT_IF(gap_min > 10 AND gap_min <= 15)     AS gap_hist_15,
+         COUNT_IF(gap_min > 15 AND gap_min <= 20)     AS gap_hist_20,
+         COUNT_IF(gap_min > 20 AND gap_min <= 30)     AS gap_hist_30,
+         COUNT_IF(gap_min > 30 AND gap_min <= 60)     AS gap_hist_60,
+         COUNT_IF(gap_min > 60)                       AS gap_hist_over,
+         -- EXACT minutes summed across the open-ended (>60 min) gaps. The scorer
+         -- keys that bucket by its representative length; without this it assumed a
+         -- flat 24h per gap, which for a warehouse with multi-DAY idle stretches
+         -- (weekends, dead weeks) OVER-states the reclaim and can push the modelled
+         -- saving past the warehouse's actual warm time. Feeding the measured total
+         -- lets the bucket be keyed at its true average instead. See
+         -- evidence.gap_histogram_from_row.
+         SUM(CASE WHEN gap_min > 60 THEN gap_min ELSE 0 END) AS gap_over_minutes,
+         COUNT(*)                                     AS gap_count,
+         -- Billed warm time under TODAY's setting: query time plus the idle tail
+         -- the current auto-stop holds open after each query. Prices the reclaim.
+         SUM(dur_min + LEAST(gap_min, cur_stop_min))  AS warm_minutes,
+         percentile_approx(gap_min, 0.5)              AS median_gap_min,
+         percentile_approx(gap_min, 0.9)              AS p90_gap_min
+  FROM gaps
+  GROUP BY 1, 2
+),
+-- Query volume by minute-of-day, so the detail page can SHOW the usage pattern
+-- behind the recommendation (when is this warehouse actually busy?) AND let the
+-- reader drill from an hour into the minutes inside it.
+--   queries_by_hour        — 24 elements, index == hour-of-day.
+--   queries_by_hour_minute — 1440 elements, index == hour*60 + minute-of-hour,
+--                            so slice [h*60 : h*60+60] is one hour's per-minute
+--                            profile. The hourly array is DERIVED from it (sum of
+--                            its 60 minute buckets), so the two can never disagree.
+-- Both are ALWAYS full-length and zero-filled via a 0..N sequence: emitting only
+-- the buckets that had activity (the obvious collect_list) produces a short array,
+-- and the frontend maps array INDEX to time — so one empty bucket shifts and
+-- mislabels every bar after it. min_map's keys (hour*60+minute) are unique per
+-- group, so map_from_entries never sees a duplicate key.
+activity AS (
+  SELECT workspace_id, warehouse_id,
+         transform(
+           sequence(0, 23),
+           h -> aggregate(
+             transform(sequence(0, 59), mm -> COALESCE(element_at(min_map, h * 60 + mm), 0)),
+             0L, (acc, x) -> acc + x
+           )
+         ) AS queries_by_hour,
+         transform(
+           sequence(0, 1439),
+           k -> COALESCE(element_at(min_map, k), 0)
+         ) AS queries_by_hour_minute
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           map_from_entries(collect_list(struct(moh_key, n))) AS min_map
+    FROM (
+      SELECT c.workspace_id, c.warehouse_id,
+             hour(qh.start_time) * 60 + minute(qh.start_time) AS moh_key,
+             COUNT(*) AS n
+      FROM candidates c
+      JOIN {{ tbl('query','history') }} qh
+        ON qh.workspace_id = c.workspace_id
+       AND qh.compute.warehouse_id = c.warehouse_id
+       AND {{ m.window_lower('qh.start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, warehouse_id
+  )
+),
+-- Query volume by DAY-OF-WEEK x HOUR, so the detail page can show that a warehouse
+-- which looks "always on" in a 24-bucket hour-of-day chart is in fact idle every
+-- weekend / every night. The hour-of-day view sums all 30 days into 24 buckets and
+-- so hides exactly the gaps the recommendation reclaims; this 7x24 matrix keeps the
+-- weekly rhythm the auto-stop actually acts on.
+--   queries_by_dow_hour — ALWAYS 168 elements, index == dow*24 + hour, dow 0=Mon
+--                         .. 6=Sun. Zero-filled via a 0..167 sequence for the same
+--                         index-safety reason as the arrays above.
+-- Spark dayofweek() is 1=Sun..7=Sat; (dayofweek - 2 + 7) % 7 maps Mon->0..Sun->6.
+dow_activity AS (
+  SELECT workspace_id, warehouse_id,
+         transform(
+           sequence(0, 167),
+           k -> COALESCE(element_at(dh_map, k), 0)
+         ) AS queries_by_dow_hour
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           map_from_entries(collect_list(struct(dh_key, n))) AS dh_map
+    FROM (
+      SELECT c.workspace_id, c.warehouse_id,
+             ((dayofweek(qh.start_time) - 2 + 7) % 7) * 24 + hour(qh.start_time) AS dh_key,
+             COUNT(*) AS n
+      FROM candidates c
+      JOIN {{ tbl('query','history') }} qh
+        ON qh.workspace_id = c.workspace_id
+       AND qh.compute.warehouse_id = c.warehouse_id
+       AND {{ m.window_lower('qh.start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, warehouse_id
+  )
+),
+daily AS (
+  SELECT workspace_id, warehouse_id,
+         transform(sorted, x -> x.d)  AS active_days,
+         transform(sorted, x -> x.n)  AS queries_by_day,
+         -- Distinct days with queries. The chosen auto-stop is derived from this
+         -- warehouse's own gap distribution, which only becomes representative
+         -- across several days of real use, so score() suppresses rows below
+         -- min_observation_days (finops_rules.history).
+         size(sorted) AS observed_days
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           array_sort(collect_list(struct(d AS d, n AS n)),
+                      (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END) AS sorted
+    FROM (
+      SELECT c.workspace_id, c.warehouse_id,
+             date_format(qh.start_time, 'yyyy-MM-dd') AS d, COUNT(*) AS n
+      FROM candidates c
+      JOIN {{ tbl('query','history') }} qh
+        ON qh.workspace_id = c.workspace_id
+       AND qh.compute.warehouse_id = c.warehouse_id
+       AND {{ m.window_lower('qh.start_time') }}
+      GROUP BY 1, 2, 3
+    )
+    GROUP BY workspace_id, warehouse_id
+  )
+)
+SELECT
+  c.workspace_id,
+  c.warehouse_id,
+  c.warehouse_name,
+  c.warehouse_size,
+  c.auto_stop_minutes,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus,{{ m.contract_cost_select('cost') }}
+  gap_hist.gap_hist_1,
+  gap_hist.gap_hist_2,
+  gap_hist.gap_hist_3,
+  gap_hist.gap_hist_4,
+  gap_hist.gap_hist_5,
+  gap_hist.gap_hist_6,
+  gap_hist.gap_hist_7,
+  gap_hist.gap_hist_8,
+  gap_hist.gap_hist_9,
+  gap_hist.gap_hist_10,
+  gap_hist.gap_hist_15,
+  gap_hist.gap_hist_20,
+  gap_hist.gap_hist_30,
+  gap_hist.gap_hist_60,
+  gap_hist.gap_hist_over,
+  gap_hist.gap_over_minutes,
+  gap_hist.gap_count,
+  gap_hist.warm_minutes,
+  gap_hist.median_gap_min,
+  gap_hist.p90_gap_min,
+  activity.queries_by_hour,
+  activity.queries_by_hour_minute,
+  dow_activity.queries_by_dow_hour,
+  daily.active_days,
+  daily.queries_by_day,
+  COALESCE(daily.observed_days, 0) AS observed_days
+FROM candidates c
+LEFT JOIN cost USING (workspace_id, warehouse_id)
+LEFT JOIN gap_hist USING (workspace_id, warehouse_id)
+LEFT JOIN activity USING (workspace_id, warehouse_id)
+LEFT JOIN dow_activity USING (workspace_id, warehouse_id)
+LEFT JOIN daily USING (workspace_id, warehouse_id)

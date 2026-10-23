@@ -1,0 +1,50 @@
+resources:
+  apps:
+    brickpulse:
+      name: ${var.app_name}
+      description: "BrickPulse: read-only regional account financial observability"
+      source_code_path: ..
+      config:
+        command: ["python", "-m", "brickpulse"]
+        env:
+          # Run the synced source, never a pip-installed copy: Apps keeps installed packages
+          # between deployments, so a same-version package would keep serving old code.
+          - name: PYTHONPATH
+            value: src
+          - name: DATABRICKS_WAREHOUSE_ID
+            value_from: sql-warehouse
+          - name: BRICKPULSE_COMPUTE_MODE
+            value: precompute
+          - name: BRICKPULSE_AUTH_MODE
+            value: sp
+          # Only the deploying user, as platform admin; nobody else gets API access.
+          - name: BRICKPULSE_USER_SCOPE_JSON
+            value: '{"${workspace.current_user.userName}": {"role": "platform_admin"}}'
+          - name: BRICKPULSE_TABLE
+            value: ${var.catalog}.${var.schema}.finops_recommendations
+          - name: BRICKPULSE_CATALOG
+            value: system
+          - name: BRICKPULSE_LOOKBACK_DAYS
+            value: ${var.lookback_days}
+          - name: BRICKPULSE_PRICING_MODE
+            value: ${var.pricing_mode}
+          - name: BRICKPULSE_DISABLED_RULES
+            value: ${var.disabled_rules}
+          - name: BRICKPULSE_PRECOMPUTE_CACHE_TTL
+            value: "300"
+          - name: BRICKPULSE_GENIE_ENABLED
+            value: "false"
+          - name: BRICKPULSE_APPS_TAB_ENABLED
+            value: ${var.apps_tab}
+          - name: BRICKPULSE_GENIE_COSTS_TAB_ENABLED
+            value: ${var.genie_costs_tab}
+          - name: LOG_LEVEL
+            value: INFO
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: CAN_USE
+      permissions:
+        - user_name: ${workspace.current_user.userName}
+          level: CAN_MANAGE

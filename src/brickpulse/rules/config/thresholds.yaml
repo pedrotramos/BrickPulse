@@ -1,0 +1,743 @@
+# Externalized, runtime-tunable configuration for the cost-saving rules.
+# Adjust these to change WHAT counts as wasteful — no code change required.
+# Each top-level key (other than the engine-wide ones) matches a Rule.id.
+
+# ---- engine-wide ----
+lookback_days: 30          # window for precompute mode (cost & utilization).
+                           # Live mode ignores this and uses the shorter
+                           # FINOPS_LIVE_LOOKBACK_DAYS to stay fast.
+# Recency GATE window (engine-wide). A resource that billed within lookback_days but
+# had NO billed usage in the last recency_days is stale/stopped, so any recommendation
+# on it is dropped by the shared gate in the precompute pipeline — you cannot
+# save on a resource that is no longer running. Resources never seen in billing are
+# KEPT (cannot confirm stale). interactive_to_job additionally sizes its dollars on
+# this window (run-rate); other rules keep their lookback_days dollar sizing but are
+# still gated. Set to lookback_days to disable the gate.
+recency_days: 7
+# Minimum days of OBSERVED ACTIVITY a resource must accumulate before ANY rule may
+# recommend an action on it. A cluster that has only existed since yesterday looks
+# statistically identical to a chronically idle one — extrapolating one afternoon
+# to a monthly dollar figure is sampling noise, not a finding. Each rule's SQL
+# emits observed_days (distinct active days on its own primary evidence source)
+# and every score() suppresses rows below this bar. Distinct days, not a
+# contiguous streak, so a weekday-only resource still qualifies. Clamped to
+# lookback_days at runtime — see rules/finops_rules/history.py.
+min_observation_days: 5
+catalog: system
+currency: USD
+# auto: add account_prices estimates when accessible; list: never read it;
+# account: require accessible contract rates or fail the pipeline update.
+# List-price baselines are always retained for comparison. A resource with less
+# than contract_min_coverage remains list-only even in account mode.
+pricing_mode: auto
+# Contract rates (system.billing.account_prices) + cloud VM cost (cloud_infra_cost) are
+# capability-gated: probed once per run and used only when the table has data. A finding
+# gets a contract figure (price_basis=contract) only when at least this share of its
+# usage had a contract price; otherwise it stays list-only rather than showing a
+# half-contract, half-list figure. See rules/finops_rules/price_basis.py.
+contract_min_coverage: 0.95
+# Phased downsizing (docs/ADDING_A_RULE.md, "Rules that reduce capacity"). A rule that
+# lowers capacity users can feel (warehouse size or cluster floor, cluster workers, a
+# pool's warm instances) recommends ONE bounded step now and the rest as a plan: each
+# step is at most max_step_ratio times smaller (30 -> 10 -> 4 -> 2 -> 1), with about
+# observe_days between steps to watch queueing / latency / spill. The finding still
+# leads with the FULL saving (to what the data supports); the first step is its low
+# end. Timeouts (auto-stop, auto-termination) are NOT phased. A rule may override the
+# ratio in its own block with phasing_max_step_ratio. See rules/finops_rules/phasing.py.
+phasing:
+  max_step_ratio: 3
+  observe_days: 7
+
+# ---- per-rule blocks ----
+cluster_autotermination:
+  enabled: true
+  max_acceptable_minutes: 60   # missing/0/>this => candidate
+  min_idle_events: 3           # only flag if genuinely idle in the window
+  # Count a minute active if a notebook command ran (system.access.audit), not
+  # just CPU >= 10%. Removes the biggest false-idle source on interactive
+  # clusters, but requires the system.access schema enabled + SELECT. Job-task
+  # activity is always used; this only adds the notebook-command signal.
+  use_audit_activity: false
+
+warehouse_autostop:
+  enabled: true
+  max_acceptable_minutes: 30   # missing/0/>this auto-stop => candidate
+  target_autostop_minutes: 10  # counterfactual auto-stop we price reclaim against
+                               # (interval simulation; matches the 10-min "how")
+  # evidence.savings_curve (PR F1b): the same counterfactual is priced at each of
+  # these settings (those between the target and today's), in the same SQL pass, so
+  # "Saved so far" can value a partial move (240 -> 30 when we proposed 10).
+  savings_curve_minutes: [10, 15, 20, 30, 45, 60, 90, 120]
+
+# Serverless counterpart of warehouse_autostop. The classic rule EXCLUDES
+# serverless; this one covers it. The recommended value is NOT a fixed constant:
+# it is derived per warehouse from its own inter-query gap distribution, bounded
+# to a usability-safe window. Recommending the 1-minute API floor maximizes the
+# modelled saving but makes the warehouse stop between queries its users fire
+# minutes apart — a bad trade for a few dollars.
+warehouse_autostop_serverless:
+  enabled: true
+  max_acceptable_minutes: 10        # serverless default is 10; >this => candidate
+  min_autostop_minutes: 5           # never recommend below this (Databricks UI floor)
+  max_autostop_minutes: 10          # never recommend above this (serverless default)
+  # A candidate adding no more than this many stop/start cycles per day counts as
+  # unobtrusive — the usability guard that stops us chasing pennies.
+  max_extra_stops_per_day: 3
+  # Above that but within this, we still recommend, flagged HIGH-CHURN with the
+  # restart cost stated (a warehouse polled hourly can be mostly idle tail — real
+  # money the admin should see and decide on). Beyond it we suppress entirely.
+  churny_stops_per_day: 30
+  # Minutes charged against the reclaim for each extra restart a shorter setting
+  # introduces. Serverless starts in seconds, but the next query still waits.
+  startup_penalty_minutes: 1
+  # evidence.savings_curve (PR F1b): net reclaim at each of these settings (those
+  # between the proposal and today's), from the gap histogram, for "Saved so far".
+  savings_curve_minutes: [10, 15, 20, 30, 45, 60, 90, 120]
+
+idle_zombie_clusters:
+  enabled: true
+  # A running single-node cluster floors at ~6% CPU from pure driver/JVM
+  # overhead (verified on an idle Standard_F4s_v2: avg 5.9% CPU over 6019
+  # windows), so a 5% threshold hid genuinely-idle clusters. 10% captures the
+  # overhead floor while staying well below any real workload.
+  idle_cpu_pct_threshold: 10   # avg CPU below this = effectively idle
+  min_idle_windows: 8          # sustained idle windows before flagging
+  # A true zombie is abandoned — no scheduled work depends on it. A cluster kept
+  # warm by a job (low CPU because the job is trivial or on the wrong compute) is
+  # NOT a terminate candidate; it's handled by interactive_to_job /
+  # cluster_autotermination. 0 => any recurring job run defers it to those rules.
+  max_job_runs: 0
+  # Defer to cluster_autotermination when a tighter/added auto-stop is the honest
+  # fix. An idle interactive cluster with NO auto-stop or a LOOSE one is what
+  # auto-termination reclaims — "add/tighten auto-stop" beats "terminate" on a
+  # shared box someone may reconnect to (the two rules used to double-fire with
+  # opposite advice on the same cluster). Only a cluster ALREADY on a tight
+  # timeout that is STILL idle around the clock survives as a genuine zombie.
+  defer_to_autostop_when_reclaimable: true
+  max_acceptable_autostop_minutes: 60   # timeout > this (or missing) => defer to auto-stop
+  # forward-spend guard: size the actionable saving on the last N days of
+  # billed spend, not the whole lookback. A cluster with no spend in this recent
+  # window has STOPPED, so terminating it saves $0 forward (advisory hygiene) rather
+  # than the whole-lookback annualization the old code booked.
+  recency_days: 7
+
+interactive_to_job:
+  enabled: true
+  min_monthly_cost_usd: 200    # only worth migrating above this spend
+  min_runs: 3                  # recurring only: >= this many runs in the window
+  # PROTOTYPE (recency fix): size the reassignable spend/savings on this SHORT
+  # recent window and gate on activity within it, so a cluster that ran hot earlier
+  # in lookback_days but has since stopped is not sold as ongoing monthly savings.
+  # Recurrence (min_runs) is still judged over the full lookback_days window.
+  recency_days: 7
+  # dedicated-vs-shared split: a cluster whose jobs occupied at least this
+  # share of its WALL-CLOCK uptime has essentially no interactive/idle time, so it is
+  # a job cluster misconfigured as all-purpose — removing the jobs eliminates it and
+  # the measured price gap is genuinely realizable (score() books it). Below this
+  # share the cluster is shared/interactive: it may keep running for interactive use
+  # after the jobs move, so the lower bound is $0 and the finding stays estimated.
+  dedicated_active_frac: 0.9
+  # Fallback saving fraction used ONLY when the real all-purpose-vs-jobs-compute price
+  # gap is unavailable in list_prices for the cloud.
+  # The gap runs 30-55% in practice; the measured path uses the exact figure, so this
+  # fallback deliberately takes the CONSERVATIVE LOW END (~30%) rather than the mid
+  # (the old 0.45). Since the gap is UNMEASURED on this path, the finding is advisory
+  # (shown/rankable but booking nothing) at MEDIUM confidence.
+  fallback_savings_fraction: 0.30
+
+# Concurrent job runs saturating a shared all-purpose cluster (advisory: $0
+# savings, ranks on the contended spend at risk). Calibrated against live data:
+# a cluster saturated equally whether one or several jobs run is UNDERSIZED, not
+# contended, so contention requires saturation both HIGH during overlap and
+# rising materially above the solo level. min_measured_frac is the coverage gate
+# that keeps phantom concurrency (job timeline present, no node telemetry) out.
+cluster_job_contention:
+  enabled: true
+  min_monthly_cost_usd: 100    # min contended all-purpose spend to be worth splitting
+  min_concurrent_runs: 2       # peak distinct job runs overlapping in a minute
+  min_contended_minutes: 15    # habitual overlap, not a one-off collision
+  min_measured_frac: 0.5       # >= this share of contended minutes must have telemetry
+  cpu_saturated_pct: 75        # p95 CPU during overlap at/above this = CPU-saturated
+  mem_saturated_pct: 85        # p95 memory during overlap at/above this = mem-saturated
+  min_saturation_delta_pct: 15 # avg during overlap must exceed solo by >= this (the rise)
+
+# GPU instance provisioned but the runtime can't use the GPU (no '-gpu-ml' runtime
+# on a gpu_count>0 node type). Advisory by design: GPU shares the CPU compute SKU
+# and the dominant cloud-VM GPU premium is not in system tables, so no $ is booked;
+# the finding ranks on the billed DBU spend at risk (a floor on the true waste).
+gpu_wrong_runtime:
+  enabled: true
+  # Only surface clusters whose visible billed DBU spend clears this monthly floor.
+  # The true cost is higher (the cloud-VM GPU premium isn't in system tables); this
+  # floor is on the DBU spend we CAN see.
+  min_monthly_cost_usd: 25
+
+rightsize_underutilized:
+  enabled: true
+  # Phased downsizing: halve the workers per step (64 -> 32 -> 16 -> 8 -> 4), not the
+  # engine-wide 3x: the target is sized from CPU, a proxy for whatever binds first
+  # (memory, spill, I/O), so the steps are smaller.
+  phasing_max_step_ratio: 2
+  cpu_headroom_pct: 40         # PRIMARY entry gate: avg CPU below this => oversized
+  # peak-based sizing. The target size keeps the MEASURED p95 CPU near
+  # target_utilization with headroom to spare, so a bursty cluster (low average
+  # but a high peak) is NOT shrunk into its own peak. keep_fraction =
+  # p95_cpu*(1+headroom)/target_utilization; the candidate worker count and the
+  # dollar saving both derive from it (see savings.rightsize_savings).
+  target_utilization: 0.6      # aim to run the p95 peak at ~60% after the shrink
+  headroom: 0.15               # extra slack above the peak before sizing down
+  max_savings_fraction: 0.6    # cap: CPU is a proxy for the binding resource
+  min_savings_usd: 25          # floor on the recoverable amount
+  # Memory is a one-way veto, NOT a co-requirement. A CPU-idle JVM cluster holds
+  # heap resident (40-70% is normal), so requiring mem<40 too hid real idle
+  # clusters. Only decline to downsize when memory is high enough to be
+  # plausibly memory-bound (OOM/spill risk on a smaller cluster) — tested on the
+  # p95 PEAK the smaller cluster must absorb, since fewer workers concentrate the
+  # same data onto fewer nodes.
+  mem_bound_pct: 85
+  mem_headroom_pct: 40         # legacy key; kept for back-compat fallback
+
+# Over-provisioned JOB compute. Aggregates node_timeline by the recurring job (job
+# clusters are ephemeral) and splits driver vs worker utilization to classify the
+# dominant symptom: driver-bound (workers idle, go single-node), idle-workers (cut
+# worker count), or memory-oversize (smaller-memory node class). Savings are a
+# conservative haircut on the worker/node share (see savings.jobs_compute_rightsize_savings).
+jobs_compute_rightsize:
+  enabled: true
+  min_runs: 5                  # distinct run-clusters: a stable pattern, not one run
+  worker_idle_cpu_pct: 5       # workers below this avg CPU => idle (driver-bound signal)
+  driver_active_cpu_pct: 10    # driver at/above this while workers idle => work is on the driver
+  cpu_headroom_pct: 40         # avg CPU below this => oversized (idle-workers / mem checks)
+  cpu_peak_pct: 60             # peak veto: workers whose p95 CPU reaches this are
+                               # needed at the burst, so we DON'T strip them even if idle on average
+  mem_oversize_pct: 30         # avg memory below this => far more memory than used
+  mem_bound_pct: 85            # one-way veto: don't cut workers / shrink node on memory-bound peaks
+  savings_fraction: 0.30       # conservative haircut on the structural recoverable base
+
+enable_photon_dbr:
+  enabled: true
+  min_dbr_major: 13            # DBR older than this major => candidate
+  # Photon / DBR-upgrade price-performance uplift, SEGMENTED by workload class
+  #. The old flat 15% was indefensible: Photon accelerates
+  # SQL/Spark operators strongly, helps I/O-heavy ETL moderately, and does almost
+  # nothing for Python/ML code. We classify the cluster's runtime and apply the
+  # matching fraction. Conservative and honest about the limit: we can reliably tell
+  # an ML runtime and a Photon-already-on runtime from the DBR string, but not
+  # SQL-BI vs ETL on a general all-purpose cluster, so the unclassified case keeps
+  # the conservative "mixed" floor and the finding stays LOW confidence with a
+  # disclaimer. A finer workload-profiled split is a documented follow-up.
+  uplift_ml: 0.05              # ML/Python-heavy runtime — Photon barely applies
+  uplift_photon_on: 0.05       # Photon already enabled — only the DBR upgrade remains
+  uplift_mixed: 0.15           # unclassified all-purpose cluster (conservative floor)
+
+enable_serverless:
+  enabled: true
+  min_monthly_cost_usd: 300
+  # Saving = removed all-in idle cost - higher serverless rate on active hours, so
+  # an active-heavy warehouse can net to $0 and is suppressed. Serverless list rate
+  # is ALL-IN; classic/pro DBU rates below EXCLUDE the cloud VM (billed separately,
+  # not in system.billing.usage), so we add an ESTIMATED VM cost to compare like-for-
+  # like and label the result an estimate. All rates are AWS US East list $/DBU —
+  # override per your cloud/region/contract.
+  classic_dbu_rate: 0.22
+  pro_dbu_rate: 0.55
+  serverless_dbu_rate: 0.70
+  # Estimated classic/pro cloud VM cost, $/DBU (surfaced as an estimate, never a
+  # measured figure). The flat AWS-US-East value may not be accurate for other
+  # cloud regions; the rule picks the per-cloud value below by the
+  # warehouse's cloud when known, and falls back to est_vm_cost_per_dbu otherwise.
+  # NOTE: we deliberately do NOT back-calc VM = serverless_rate - classic_rate: that
+  # gap also contains Databricks' serverless margin, and using it would zero the
+  # active-hours premium by construction (see savings.serverless_migration_savings).
+  # Region- and warehouse-size variance (memory-optimized nodes on big warehouses)
+  # is a documented follow-up, not modelled here.
+  est_vm_cost_per_dbu: 0.22           # default when cloud is unknown
+  est_vm_cost_per_dbu_by_cloud:       # $/DBU, list-based, per cloud
+    aws: 0.22
+    azure: 0.26
+    gcp: 0.24
+  # Only surface above this idle share (the estimate is VM-cost-sensitive, so we want
+  # idle headroom that makes the call robust). for PRO warehouses the
+  # active-hours premium is often NEGATIVE (serverless is cheaper per active hour too),
+  # so a lower gate is safe and hiding low-idle pro migrations loses real savings. We
+  # therefore gate PER TIER. 0 disables the gate.
+  min_idle_fraction: 0.30             # classic (active premium is always positive)
+  min_idle_fraction_pro: 0.15         # pro (active hours already ~break-even/cheaper)
+
+# Idle Databricks Apps — the Apps blind spot. An app that bills continuously (running serverless
+# compute) but nobody opens is waste, the analogue of an idle serving endpoint.
+# NOTE: the access signal is system.access.audit. The audit app-access filter in the SQL is
+# best-effort and MUST be validated on a workspace that hosts Apps before this rule
+# is trusted; until then it is medium-confidence with a verify-then-act action.
+idle_apps:
+  # DISABLED — the databricksApps audit stream is lifecycle-only, so app
+  # idleness cannot be substantiated. Re-enable only with a real access
+  # signal.
+  enabled: false
+  max_access_events: 0         # 0 => only genuinely zero-access apps
+  min_days_billed: 7           # must bill consistently to be an always-on cost
+  min_monthly_cost_usd: 25     # floor; below this it is not worth an admin's time
+
+unused_scheduled_jobs:
+  enabled: true
+  min_days_since_last_run: 30  # scheduled but not run in this many days
+  require_activity_or_cost: true  # suppress never-run, zero-cost leftovers (UI noise)
+
+spot_fallback:
+  enabled: true
+  # Lowered 200 -> 50 so the minimized test fixture (on-demand 2-worker classic,
+  # ~$120/mo) clears the floor and the rule demos. In a real deployment $200 is
+  # the more defensible bar for the migration effort.
+  min_monthly_cost_usd: 50     # only worth changing above this on-demand spend
+  # Movable fraction and spot discount are SEGMENTED by workload. Automated batch (job / pipeline clusters) is eviction-tolerant, so
+  # a larger share moves and the observed spot discount is deeper; interactive
+  # all-purpose clusters keep the conservative defaults because a preemption is a
+  # user-visible disruption. The rule picks the pair by the cluster's source.
+  movable_fraction: 0.50          # interactive (UI/API all-purpose): mid, conservative
+  spot_discount: 0.70             # interactive: spot vs on-demand VM price gap (AWS baseline)
+  movable_fraction_automated: 0.75  # jobs / pipeline clusters (fault-tolerant batch)
+  spot_discount_automated: 0.60     # automated: still-conservative deeper discount
+  restart_overhead: 0.10       # savings lost replaying evicted work
+  # Per-cloud CEILING on the spot/on-demand price gap.
+  # The market discount is cloud-specific — AWS ~0.65-0.75, Azure ~0.50-0.60, GCP
+  # variable/deep-but-preemptible — so a single AWS-shaped default OVERSTATES the
+  # saving on Azure/GCP, where most EU customers run. The rule caps the workload
+  # discount above at the cloud's CONSERVATIVE LOW END, so we never overstate: on AWS
+  # the ceiling is above the 0.70/0.60 defaults (no effect); on Azure/GCP it pulls
+  # them down. Cloud unknown uses the conservative default ceiling rather than assuming the generous AWS rate.
+  spot_discount_ceiling_by_cloud:
+    aws: 0.75
+    azure: 0.55
+    gcp: 0.60
+  spot_discount_ceiling_default: 0.55   # cloud unknown => never assume the AWS rate
+
+serverless_cost_optimized:
+  enabled: true
+  # Lowered 100 -> 15 so the minimized perf-mode fixture (~$20/mo serverless
+  # JOBS spend) clears the floor and the rule demos. $100 is the more defensible
+  # bar in a real deployment.
+  min_monthly_cost_usd: 15     # only worth switching above this serverless spend
+  dbu_reduction: 0.50          # DBU reduction Standard mode delivers (~50%)
+  short_run_minutes: 10        # median run below this => short => suppressed (poor fit;
+                               # only jobs with a known median run >= this are recommended)
+
+# Gap G1 — chronically-failing jobs (reliability waste). Failed runs still bill
+# compute but produce nothing; we credit only the failure rate above a healthy
+# baseline. Defaults chosen from the fleet distribution observed in the test
+# workspace (median job fail rate ~0; a small tail fails heavily).
+failing_jobs:
+  enabled: true
+  min_runs: 20                 # recurring only: enough terminal runs to be a pattern
+  min_failures: 3              # at least a cluster of failures, not one fluke
+  min_fail_rate: 0.10          # flag only jobs failing >= this share
+  baseline_fail_rate: 0.05     # treat <= this as unavoidable noise (credited $0)
+  # Continuous/streaming jobs (trigger_type = 'CONTINUOUS') restart on error BY
+  # DESIGN, so their error terminations are normal operation, not reclaimable waste.
+  # A job whose runs are more than this share continuous is excluded outright.
+  # Measured across many accounts (30d): such jobs are ~3% of flagged
+  # jobs but ~half of credited savings, almost all of it spurious.
+  max_continuous_run_share: 0.5
+
+# Gap G2 — jobs producing data nobody reads. Uses table_lineage writes-with-no-
+# reads. Lineage read-capture is incomplete, so guards are strict and only a
+# fraction of the producing cost is credited (confidence: low).
+unused_data_jobs:
+  enabled: true
+  max_output_tables: 5         # focused producer, not a sprawling platform
+  min_writes: 10               # recurring writes, not a one-off new table
+  # Credited share of the producing cost. a flat 50% is
+  # arbitrary and ignores signal strength. We now scale between a floor and a
+  # ceiling by how STRONG the "dead data" evidence is: a job that wrote on nearly
+  # every day of the window and was still never read is a far stronger signal than
+  # one that wrote a handful of times, so it earns a higher (but still capped)
+  # credit. NOTE: the reviewer's 90-day-age tier is not observable inside a 30-day
+  # lookback; scaling on observed consistency uses the signal we actually have.
+  # Deeper age/consumption signals (DESCRIBE HISTORY, information_schema access)
+  # are a documented follow-up.
+  recoverable_fraction: 0.5        # floor: default lineage-gap-adjusted credit
+  recoverable_fraction_high: 0.7   # ceiling: consistent producer, still never read
+  # Share of the window's days the job must have produced on to count as a
+  # "consistent producer" that earns the higher credit.
+  consistent_producer_day_frac: 0.8
+
+# Gap G3 — over-provisioned warehouse SIZE (rightsize_underutilized is cluster-
+# only). Infers oversizing from query-load headroom; warehouses expose no CPU so
+# confidence is low and we propose a single, exact-priced ladder step down.
+# Model serving endpoints that bill continuously but serve no traffic. The only
+# HIGH-confidence idleness rule: system.serving.endpoint_usage is a per-request
+# log, so "nobody calls this" is COUNTED, not inferred from a proxy. The SQL
+# already restricts candidates to endpoints that bill while idle (provisioned
+# throughput, or min_concurrency > 0) — a scale-to-zero endpoint costs nothing
+# when idle, so recommending its removal would save $0.
+idle_serving_endpoints:
+  enabled: true
+  max_requests: 0              # 0 => zero-traffic endpoints get the FULL-cost (high-confidence) tier
+  min_days_billed: 7           # must bill consistently to be an always-on cost
+  min_monthly_cost_usd: 25     # floor; below this it is not worth an admin's time
+  # Low-traffic scale-to-zero tier. An endpoint hit only a
+  # handful of times a day but kept always-warm is a big miss: scale-to-zero (now GA)
+  # reclaims most of the idle cost at the price of a cold start on the first request
+  # in an idle window. We surface these at MEDIUM confidence (the idle share is
+  # estimated, not the zero-traffic certainty) and credit a conservative fraction.
+  # Only when scale-to-zero is available (min_concurrency>0 and not provisioned
+  # throughput); provisioned throughput has no cheap lever, so it is not surfaced.
+  low_traffic_max_requests_per_day: 100  # above this, treat as genuinely in use ($0)
+  low_traffic_reclaim_frac: 0.7          # conservative share scale-to-zero reclaims
+
+warehouse_rightsize:
+  enabled: true
+  min_monthly_cost_usd: 100    # only worth the downsize risk above this spend
+  min_queries: 100             # enough queries to characterise the load
+  max_queued_pct: 0.02         # >this => concurrency-bound (a cluster lever, not size)
+  max_spilled_pct: 0.01        # >this => memory-bound => do NOT downsize
+  max_p95_read_gb: 10          # >this => data-bound => size may be justified
+  steps_down: 1                # proxy-only fallback: conservative single step
+  # Measured Spark-slot signal (total_task_duration_ms). When present it is the
+  # primary evidence: peak slots busy must fit the smaller size divided by
+  # slot_headroom_factor, and confidence rises to medium. Absent => proxy-only path.
+  slot_headroom_factor: 2.0    # only step down while peak uses <half the smaller size
+  max_steps_down: 3            # measured demand may justify several steps; capped here
+
+# The mirror of warehouse_rightsize: an UNDER-provisioned warehouse whose queries
+# QUEUE at capacity. The lever is max_clusters (a concurrency shortage), NOT the
+# t-shirt size (that fixes spill, a per-query memory shortage — verified rare on
+# queueing warehouses). NOT a savings rule: adding a cluster raises the busy-hour
+# bill, so it books $0 savings and ranks on the measured queue-wait pain, framed
+# as a performance/reliability fix (same contract as untagged_spend).
+warehouse_scale_out:
+  enabled: true
+  min_queries: 100             # enough queries to characterise the load
+  min_queued_pct: 0.10         # >= this share waited at capacity => under-provisioned
+  # Queue wait must be long enough that a human actually notices it. Verified
+  # necessary: many warehouses "queue" a few percent of queries for sub-second
+  # times (p95 0.0-0.1s) that round to zero hours of wait — real contention, but
+  # not worth a bill increase. Only flag when the typical queued query waits at
+  # least this long.
+  min_p95_queue_wait_s: 2.0
+  scale_out_step: 2            # max clusters to add in one step (2 under severe queueing, else 1)
+  max_clusters_ceiling: 10     # never propose beyond this many clusters
+  # Rule of thumb: a DBSQL cluster comfortably serves ~10 concurrent
+  # queries even for heavy CTAS work, so measured peak concurrency / this is a
+  # principled floor on the clusters needed. Used to pick the step (severe concurrency
+  # => the full 2-cluster step) and shown as context; we still never jump more than
+  # scale_out_step in one recommendation (widen iteratively after watching the queue).
+  max_queries_per_cluster: 10
+
+# Gap: chargeback/showback — spend that cannot be attributed to an owner.
+# The only rule whose savings are $0 by design (tagging changes attribution, not
+# the bill); it ranks on the size of the unattributable spend instead. See
+# rules/finops_rules/catalog/untagged_spend.py.
+untagged_spend:
+  enabled: true
+  # Required ownership tags -> the key spellings that satisfy each. Matched
+  # case-INSENSITIVELY (keys are lowercased before comparison), so listing
+  # 'owner' also matches 'Owner' and 'OWNER'. Verified necessary: the test
+  # account carries `Owner` AND `owner` as separate keys, and `Project` AND
+  # `project` — an exact-match check would report tagged resources as untagged
+  # and make the whole report ignorable. Add your organization's spellings here.
+  required_tags:
+    owner: [owner, ownedby, owner_email, ownername, contact]
+    team: [team, department, dept, group, businessunit, business_unit]
+    project: [project, application, app, service, workload]
+    environment: [environment, env, stage, tier]
+    cost_center: [cost_center, costcenter, cost-centre, costcentre, cc, billingcode]
+  # How many required tags must be missing before we report. 1 = report a resource
+  # missing any single tag. Raise it to focus on the worst offenders first.
+  min_missing_tags: 1
+  # Below this monthly spend the governance gap is real but not worth an admin's
+  # time, and one finding per trivial cluster would bury the money rules.
+  min_monthly_cost_usd: 50
+  # Priority bands, on unattributable monthly spend rather than tag count: a $5k/mo
+  # resource missing one tag matters more than a $50/mo one missing all five.
+  high_priority_monthly_usd: 1000
+  medium_priority_monthly_usd: 250
+
+# Gap: DLT / Lakeflow Declarative Pipelines — the largest previously-unruled slice
+# of spend (verified live: 359 pipelines, ~$16.4k/mo, no rule looking at any of
+# them; 3 continuous pipelines carried 72% of it). Continuous mode holds compute up
+# around the clock, so the waste is the billed hours in which no update ran — a
+# COUNTED figure, not a proxy. See catalog/continuous_pipeline.py.
+continuous_pipeline:
+  enabled: true
+  # Share of billed hours with no update in flight before we call it idle. Below
+  # this the pipeline is genuinely streaming and continuous is the correct setting —
+  # switching would break the latency requirement it exists to meet.
+  min_idle_hours_frac: 0.5
+  min_monthly_cost_usd: 100   # below this the switch is not worth the conversation
+  min_savings_usd: 25         # floor on the recoverable amount
+  # Share of the reclaimed idle cost given back for per-run compute start-up on a
+  # triggered schedule. Keeps a frequently-triggered pipeline from over-claiming.
+  # the 15% figure was calibrated for classic compute
+  # (minutes to spin a cluster). Serverless DLT starts in seconds, so a flat 15%
+  # over-penalizes it; the rule uses the serverless value below when the pipeline
+  # is serverless and keeps 15% for classic.
+  startup_overhead_frac: 0.15             # classic compute (floor)
+  startup_overhead_frac_serverless: 0.05  # serverless DLT (fast start) (floor)
+  # Cadence-aware overhead. The flat fractions above
+  # are a FLOOR; a pipeline triggered very often pays more per-run start-up than a
+  # fixed fraction assumes, so the rule also estimates the start-up cost from the
+  # measured update cadence (updates x minutes-per-start / idle minutes) and takes the
+  # MAX of that and the floor. Overhead can therefore only RISE (savings only fall) —
+  # never drop below the conservative floor — for a frequently-triggered pipeline.
+  startup_minutes_classic: 7.0            # billed minutes to spin classic compute per run
+  startup_minutes_serverless: 0.5         # serverless DLT starts in seconds
+  # Priority bands on recoverable spend: effort is identical across findings (a
+  # settings toggle plus a schedule), so money is what should order them.
+  high_priority_savings_usd: 500
+  medium_priority_savings_usd: 100
+
+# ============================ EXPERIMENTAL (Labs tab) ================
+# Net-new opportunity rules still being validated. They self-declare `experimental = True`, so they are computed
+# and stored like any other rule but RELOCATED out of the main surfaces into the Labs
+# tab — never counted in the headline, never ranked in Next Best Actions. All emit
+# ADVISORY findings ($0 booked): the signal is measured but the reclaimable dollars
+# are not modelled, so they surface an ADDRESSABLE spend figure instead of a saving.
+
+# A — SQL workload efficiency: warehouses running the SAME query to failure over and
+# over, burning compute on work that produces nothing. Directly avoidable (fix/retire
+# the broken job) — but the reclaim depends on the warehouse's idle behaviour, so it
+# stays advisory. See catalog/sql_repeated_failures.py.
+sql_repeated_failures:
+  enabled: true
+  min_failed_queries: 20     # enough failed queries to be a recurring pattern
+  min_fail_rate: 0.05        # ignore warehouses whose failures are noise-level
+  min_addressable_usd: 25    # floor on the failed-compute spend worth surfacing
+
+# B — Predictive Optimization overlap: warehouses running MANUAL OPTIMIZE / VACUUM
+# statements that Predictive Optimization may already be doing on the same tables, so
+# the manual maintenance is redundant compute. We can measure the manual maintenance
+# and its cost from query history; we CANNOT prove PO covers those exact tables from
+# these tables alone, so the finding is advisory (verify in Catalog Explorer). See
+# catalog/manual_maintenance_overlap.py.
+manual_maintenance_overlap:
+  enabled: true
+  min_maintenance_runs: 10   # recurring maintenance cadence, not a one-off
+  min_addressable_usd: 25    # floor on the maintenance compute worth surfacing
+
+# C — Pipeline Events: DLT / Lakeflow pipelines burning compute on updates that end
+# FAILED / TIMED_OUT / ERROR. Complements continuous_pipeline (idle always-on compute);
+# here the waste is failed-update compute. Advisory ($0): whether the bill drops depends
+# on whether the compute would otherwise idle. See catalog/pipeline_failed_updates.py.
+pipeline_failed_updates:
+  enabled: true
+  min_failed_updates: 10     # enough failed updates to be a recurring pattern
+  min_fail_rate: 0.05        # ignore pipelines whose failures are noise-level
+  min_addressable_usd: 25    # floor on the failed-update compute worth surfacing
+
+# D — AI Gateway efficiency: serving endpoints fronted by the AI Gateway returning a
+# high rate of ERRORS (status_code >= 400), burning inference capacity / tokens on
+# requests that produce nothing usable. Advisory ($0): the reclaim is real only on a
+# pay-per-token endpoint, not a provisioned one. See catalog/ai_gateway_wasted_inference.py.
+ai_gateway_wasted_inference:
+  enabled: true
+  min_failed_requests: 100   # enough failed requests to be a recurring pattern
+  min_error_rate: 0.05       # ignore endpoints whose errors are noise-level
+  min_addressable_usd: 25    # floor on the failed-inference spend worth surfacing
+
+# G — instance pools (OPERATIONAL, $0): pools keeping warm idle VMs on standby
+# (min_idle_instances). Those are cloud VMs billed outside Databricks DBUs, so this rule
+# reports the warm-instance count, not a DBU dollar figure. See catalog/instance_pool_idle.py.
+instance_pool_idle:
+  enabled: true
+  min_warm_instances: 2      # warm floor worth flagging (min_idle_instances >= this)
+
+# F — Delta Sharing (OPERATIONAL, $0): shares re-materialized repeatedly (recompute +
+# cross-region egress). The event table records no cost, so this reports the
+# materialization count, not dollars. See catalog/delta_sharing_materialization.py.
+delta_sharing_materialization:
+  enabled: true
+  min_materializations: 10   # recurring cadence, not a one-off re-share
+
+# H — storage lifecycle (OPERATIONAL, $0): tables drawing heavy Predictive Optimization
+# maintenance (compaction/clustering/vacuum), usually a fragmenting write pattern. Reports
+# PO's own estimated DBUs, not booked dollars. See catalog/storage_optimization_churn.py.
+storage_optimization_churn:
+  enabled: true
+  min_po_dbus: 50            # estimated PO DBUs over the window worth flagging
+  min_operations: 30         # enough PO operations to be a recurring pattern
+
+# B4 — pipelines doing FREQUENT full refreshes (update_type FULL_REFRESH, or a REFRESH
+# with a non-empty full_refresh_selection). Addressable = sum over full-refresh updates
+# of (update cost - the pipeline's median completed incremental update cost). Advisory
+# ($0 booked, experimental/Labs). See catalog/pipeline_full_refresh_churn.py.
+pipeline_full_refresh_churn:
+  enabled: true
+  min_full_refreshes: 2          # one full refresh is a normal reset, not churn
+  min_incremental_updates: 3     # completed incremental updates needed for a baseline
+  min_addressable_usd: 25        # floor on the monthly excess worth surfacing
+
+# B3 — task retries hidden inside eventually-SUCCEEDED job runs (failing_jobs prices
+# only failed runs). Advisory ($0): failed-attempt spend is measured but apportioned by
+# wall-time. Experimental (Labs). See catalog/job_task_retry_waste.py.
+job_task_retry_waste:
+  enabled: true
+  min_runs: 10                 # successful runs: enough to measure a retry rate
+  min_retried_runs: 5          # a recurring pattern, not a one-off flake
+  min_retry_days: 3            # retries spread over days — one bad afternoon is an incident
+  min_retry_rate: 0.10         # flag only jobs retrying in >= this share of runs
+  baseline_retry_rate: 0.05    # treat <= this as healthy noise (credited $0)
+  max_continuous_run_share: 0.5  # streaming jobs restart by design (as failing_jobs)
+  min_addressable_usd: 25      # floor on the credited failed-attempt spend
+
+# B5: provisioned-throughput serving endpoints that DO get traffic but hold reserved
+# capacity through long runs of billed hours with zero logged requests. Advisory ($0);
+# zero-traffic endpoints are left to idle_serving_endpoints. See
+# catalog/serving_provisioned_overcapacity.py.
+serving_provisioned_overcapacity:
+  enabled: true
+  min_idle_run_hours: 3          # only idle stretches this long are reclaimable (PT cold start)
+  min_idle_cost_share: 0.3       # idle-run hours must be at least this share of PT spend
+  min_days_billed: 7             # a standing reservation, not a one-off test
+  min_addressable_usd: 50        # floor on the idle-capacity spend worth surfacing
+  max_requests_defer_to_idle: 0  # <= this many logged requests -> idle_serving_endpoints' case
+
+# B6 — all-purpose cluster SHAPE mismatch (experimental / Labs, advisory $0): a
+# driver-bound cluster (driver works, workers idle while active -> single-node) or a
+# wrong worker FAMILY (memory-dense family peaking far below its memory -> same-core
+# general-purpose type, priced by the OBSERVED DBU/node-hour delta; compute-optimized
+# family under memory pressure -> general-purpose, $0). See catalog/allpurpose_shape_mismatch.py.
+allpurpose_shape_mismatch:
+  enabled: true
+  active_cpu_pct: 20             # a minute counts as ACTIVE if the driver or any worker reaches this CPU
+  worker_idle_cpu_pct: 5         # every worker below this (max across workers) in a minute => workers idle
+  min_active_minutes: 120        # enough active time to judge the shape
+  driver_only_share: 0.6         # share of active minutes that were driver-only => driver-bound
+  cpu_peak_pct: 60               # peak veto: worker p95 CPU (active minutes) at/above this => workers needed
+  memory_family_gb_per_core: 7   # worker family this memory-dense (GB/core) counts as memory-optimized
+  mem_oversize_p95_pct: 35       # memory-optimized workers whose p95 memory stays below this => oversized family
+  target_fill_pct: 70            # the target type must hold the measured p95 memory at <= this fill
+  general_max_gb_per_core: 4.5   # alternatives must be general-purpose density or leaner
+  compute_family_gb_per_core: 2.5  # worker family this lean counts as compute-optimized
+  swap_p95_pct: 5                # compute-optimized workers swapping at p95 >= this => memory pressure
+  mem_pressure_p95_pct: 90       # ...or p95 memory at/above this
+  min_rate_clusters: 3           # clusters needed to trust an observed DBU/node-hour rate
+  general_min_gb_per_core: 3.5  # a memory-family move must land on a general-purpose family (not compute-optimized)
+  rate_spread_max: 0.05          # p25..p75 spread (fraction of the median) for a stable rate
+  min_addressable_usd: 25        # floor on the addressable $/mo worth surfacing
+
+# B2 — hung / runaway job runs on jobs with no (or a loose) run timeout. Advisory ($0):
+# a timeout only saves the spend if the run was truly stuck. Experimental (Labs).
+# See catalog/job_runaway_no_timeout.py.
+job_runaway_no_timeout:
+  enabled: true
+  min_runs: 8                  # recurring only: enough runs to know the normal duration
+  outlier_multiple: 5          # outlier run = > this x the job's p50 ...
+  min_outlier_seconds: 3600    # ... AND longer than 1h ... (AND > the job's p90)
+  min_outlier_runs: 2          # a repeated pattern, not one stuck run
+  timeout_p95_multiple: 3      # recommended timeout = this x p95 of the job's normal runs
+  min_timeout_seconds: 600     # never recommend a timeout shorter than 10 min
+  tighten_multiple: 10         # an existing bound above this x normal p95 is "too loose"
+  max_p90_p50_ratio: 3         # wider spread = two normal duration modes (bimodal guard) ...
+  min_unsuccessful_outlier_share: 0.5  # ... unless most outliers ended CANCELLED/ERROR (a hang)
+  max_continuous_run_share: 0.5  # majority-continuous (streaming) jobs are excluded
+  min_addressable_usd: 25      # floor on the excess spend worth surfacing
+
+# B1 — warehouse kept warm by trivial/metadata queries (BI refresh, poller, health
+# check): billed hours with only trivial statements defeat auto-stop. Advisory ($0),
+# experimental (Labs). See catalog/warehouse_keepalive_queries.py.
+warehouse_keepalive_queries:
+  enabled: true
+  history_days: 14           # query.history window (large table; matches warehouse_autostop)
+  min_keepalive_hours: 24    # billed trivial-only hours in the window before flagging
+  min_keepalive_days: 3      # spread over several days: a rhythm, not one evening
+  min_keepalive_share: 0.10  # share of billed hours that are keep-alive hours
+  min_mean_run_hours: 2      # mean contiguous keep-alive run; shorter = auto-stop tail, not a keep-alive
+  min_addressable_usd: 50    # floor on the addressable $/mo worth surfacing
+
+# Tier 2 (C5): min_clusters > 1 holds extra clusters warm (incl. serverless restart
+# churn — every start brings up min_clusters). Experimental / Labs, advisory $0.
+# Priced in cluster-minutes rebuilt from compute.warehouse_events. See
+# rules/finops_rules/catalog/warehouse_min_clusters.py.
+warehouse_min_clusters:
+  enabled: true
+  max_queries_per_cluster: 10   # same heuristic as warehouse_scale_out (~10 concurrent queries/cluster)
+  carry_in_days: 30             # how far back to look for the state at the window start
+  min_one_cluster_share: 0.90   # R3: 1 cluster must cover the load in >= this share of running minutes
+  # R3: never recommend LESS capacity where warehouse_scale_out would recommend MORE.
+  # Silent at or above this queued share on its own (no p95-wait condition), so it must
+  # stay <= warehouse_scale_out.min_queued_pct: then the two rules can never both fire.
+  # Stricter than scale_out on purpose — a warehouse queueing 47% of queries for <2s
+  # each is not one to take capacity from.
+  max_queued_pct: 0.10
+  # Sanity gate: billed DBUs per REBUILT cluster-hour may exceed the size's published
+  # DBU/h by at most this factor. Higher = events missing for part of the window, which
+  # would inflate the $/cluster-minute the saving is priced at. Live: serverless sizes
+  # reproduce the published rate exactly (L 40.0, M 24.0, S 12.0).
+  max_rate_ratio: 1.25
+  min_addressable_usd: 50       # floor on the addressable $/mo worth surfacing
+  churn_starts_per_day: 24      # at/above this, `how` names the wake-up pattern (second remedy)
+
+# C7 — scheduled (CRON/PERIODIC) job runs where no source table was written since the
+# previous successful run (table_lineage). Advisory ($0): lineage can't see non-UC
+# inputs. Experimental (Labs). See catalog/job_no_new_input.py.
+job_no_new_input:
+  enabled: true
+  min_runs: 10                   # successful scheduled runs before judging a job
+  min_no_new_input_runs: 5       # a recurring pattern, not a quiet weekend
+  min_no_new_input_days: 3       # spread over several days
+  min_no_new_input_share: 0.3    # share of evaluated runs with no new input
+  min_lineage_run_coverage: 0.5  # lineage must have logged >= this share of the runs
+  min_addressable_usd: 25        # floor on the no-new-input run spend worth surfacing
+
+# C6 — classic compute on a previous-generation instance family (mapping in
+# config/instance_generations.yaml). Advisory ($0): $ = spend on old-generation nodes.
+# Experimental (Labs). See catalog/instance_generation_modernize.py.
+instance_generation_modernize:
+  enabled: true
+  min_memory_ratio: 0.9          # successor must carry >= this x the old type's memory (Azure DS3_v2 14 GB -> D4ds_v5 16 GB)
+  max_memory_ratio: 1.6          # ...and not jump to a much larger (costlier) memory tier
+  min_rate_clusters: 3           # clusters needed to trust an observed DBU/node-hour rate
+  rate_spread_max: 0.05          # p25..p75 spread (fraction of the median) for a stable rate
+  min_addressable_usd: 50        # floor on old-generation $/mo worth surfacing
+
+alert_hygiene:
+  enabled: true
+  history_days: 14           # evaluation + query.history window (query.history is large)
+  min_error_streak_days: 7   # (a) every evaluation errored on >= this many distinct days
+  min_warm_hours: 24         # (c) billed alert-only warehouse-hours before flagging
+  min_warm_days: 3           # (c) spread over several days: a schedule, not one evening
+  min_warm_addressable_usd: 25  # (c) floor on the alert's addressable warm-hours $/mo
+
+# C8 — repeated SELECT shapes that scan ~every file (no file pruning → liquid clustering /
+# materialized view) or an identical query that never hits the result cache (likely
+# non-deterministic). Advisory ($0): the improvement factor is unknown, so the figure is
+# "$ spent on this query shape". See catalog/unpruned_repeated_queries.py.
+unpruned_repeated_queries:
+  enabled: true
+  min_executions: 20            # a shape must repeat this often to be "repeated"
+  min_shape_days: 3             # ... on at least this many distinct days
+  max_prune_ratio: 0.1          # pruned / (read + pruned) files at or below = "no pruning"
+  min_avg_read_files: 20        # a table of a handful of files cannot prune — skip it
+  min_avg_read_gb: 1.0          # per non-cached execution; small scans are not worth a layout change
+  min_uncached_runs_per_day: 4  # an identical query that runs this often should hit the cache
+  max_shapes: 25                # candidate shapes per warehouse the SQL hands to score()
+  top_shapes_shown: 5           # shapes named in the finding text / evidence
+  min_shape_usd: 10             # per-shape floor on $/mo spent
+  min_addressable_usd: 25       # per-warehouse floor on $/mo spent on flagged shapes
+
+# C4: AI/BI dashboards whose queries keep running (scheduled / background refresh)
+# while nobody has opened them for `unviewed_days`. Advisory ($0); the figure is the
+# dashboard's task-time share of its warehouse cost. Needs system.access.audit.
+unviewed_scheduled_dashboards:
+  enabled: true
+  unviewed_days: 14            # zero views for at least this long (also the pricing window)
+  min_queries: 20              # a recurring refresh, not a one-off API call
+  min_active_days: 5           # refreshes spread across the window, not one burst
+  min_addressable_usd: 25      # floor on the monthly task-share cost
+
+# Unity AI Gateway Smart Routing for coding agents (Labs): Claude Code / Codex /
+# Omnigent sessions on system.ai.* models that the router never saw. The estimate
+# applies the workspace's OWN routed-vs-unrouted cost per turn (by session size) to the
+# unrouted sessions; below min_routed_sessions it falls back to default_savings_rate.
+# Advisory ($0 booked). See catalog/coding_agent_smart_routing.py.
+coding_agent_smart_routing:
+  enabled: true
+  coding_agent_harnesses: [claude-cli, codex-tui, codex_exec, ucode, omnigent-probe, pi]
+  premium_model_pattern: "(?i)opus|fable|mythos|sol|astra"   # frontier tiers worth routing away from
+  session_gap_minutes: 30        # no session id is logged: split a requester's traffic at this gap
+  short_session_max_turns: 40    # the router saves most on short sessions; priced separately
+  min_routed_sessions: 20        # per size bucket, before the workspace's own rate is trusted
+  default_savings_rate: 0.15     # conservative fallback (Databricks publishes 30%+ on its benchmarks)
+  max_savings_rate: 0.6          # cap on a measured rate: routed sessions are self-selected
+  min_unrouted_sessions: 10      # enough unrouted sessions to be a habit, not a trial
+  min_addressable_usd: 100       # floor on monthly unrouted premium-model spend

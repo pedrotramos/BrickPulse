@@ -1,0 +1,706 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-21T20:31:30.094Z",
+  "title": "Design System: BrickPulse",
+  "extensions": {
+    "colorMeta": {
+      "logo-orange": {
+        "role": "secondary",
+        "displayName": "Logo Orange",
+        "tonalRamp": [
+          "oklch(15% 0.1496 36.41)",
+          "oklch(26.43% 0.1496 36.41)",
+          "oklch(37.86% 0.1496 36.41)",
+          "oklch(49.29% 0.1496 36.41)",
+          "oklch(60.71% 0.1496 36.41)",
+          "oklch(72.14% 0.1496 36.41)",
+          "oklch(83.57% 0.1496 36.41)",
+          "oklch(95% 0.1496 36.41)"
+        ]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Petrol",
+        "tonalRamp": [
+          "oklch(15% 0.0706 207.04)",
+          "oklch(26.43% 0.0706 207.04)",
+          "oklch(37.86% 0.0706 207.04)",
+          "oklch(49.29% 0.0706 207.04)",
+          "oklch(60.71% 0.0706 207.04)",
+          "oklch(72.14% 0.0706 207.04)",
+          "oklch(83.57% 0.0706 207.04)",
+          "oklch(95% 0.0706 207.04)"
+        ]
+      },
+      "accent-hover": {
+        "role": "primary",
+        "displayName": "Deep Petrol",
+        "tonalRamp": [
+          "oklch(15% 0.0611 207.84)",
+          "oklch(26.43% 0.0611 207.84)",
+          "oklch(37.86% 0.0611 207.84)",
+          "oklch(49.29% 0.0611 207.84)",
+          "oklch(60.71% 0.0611 207.84)",
+          "oklch(72.14% 0.0611 207.84)",
+          "oklch(83.57% 0.0611 207.84)",
+          "oklch(95% 0.0611 207.84)"
+        ]
+      },
+      "selected": {
+        "role": "primary",
+        "displayName": "Pale Petrol",
+        "tonalRamp": [
+          "oklch(15% 0.0165 211.04)",
+          "oklch(26.43% 0.0165 211.04)",
+          "oklch(37.86% 0.0165 211.04)",
+          "oklch(49.29% 0.0165 211.04)",
+          "oklch(60.71% 0.0165 211.04)",
+          "oklch(72.14% 0.0165 211.04)",
+          "oklch(83.57% 0.0165 211.04)",
+          "oklch(95% 0.0165 211.04)"
+        ]
+      },
+      "canvas": {
+        "role": "neutral",
+        "displayName": "Cool Canvas",
+        "tonalRamp": [
+          "oklch(15% 0.0021 197.12)",
+          "oklch(26.43% 0.0021 197.12)",
+          "oklch(37.86% 0.0021 197.12)",
+          "oklch(49.29% 0.0021 197.12)",
+          "oklch(60.71% 0.0021 197.12)",
+          "oklch(72.14% 0.0021 197.12)",
+          "oklch(83.57% 0.0021 197.12)",
+          "oklch(95% 0.0021 197.12)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "White Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0.00)",
+          "oklch(26.43% 0.0000 0.00)",
+          "oklch(37.86% 0.0000 0.00)",
+          "oklch(49.29% 0.0000 0.00)",
+          "oklch(60.71% 0.0000 0.00)",
+          "oklch(72.14% 0.0000 0.00)",
+          "oklch(83.57% 0.0000 0.00)",
+          "oklch(95% 0.0000 0.00)"
+        ]
+      },
+      "sidebar": {
+        "role": "neutral",
+        "displayName": "Sidebar Neutral",
+        "tonalRamp": [
+          "oklch(15% 0.0043 197.09)",
+          "oklch(26.43% 0.0043 197.09)",
+          "oklch(37.86% 0.0043 197.09)",
+          "oklch(49.29% 0.0043 197.09)",
+          "oklch(60.71% 0.0043 197.09)",
+          "oklch(72.14% 0.0043 197.09)",
+          "oklch(83.57% 0.0043 197.09)",
+          "oklch(95% 0.0043 197.09)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Graphite",
+        "tonalRamp": [
+          "oklch(15% 0.0228 219.10)",
+          "oklch(26.43% 0.0228 219.10)",
+          "oklch(37.86% 0.0228 219.10)",
+          "oklch(49.29% 0.0228 219.10)",
+          "oklch(60.71% 0.0228 219.10)",
+          "oklch(72.14% 0.0228 219.10)",
+          "oklch(83.57% 0.0228 219.10)",
+          "oklch(95% 0.0228 219.10)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted Graphite",
+        "tonalRamp": [
+          "oklch(15% 0.0257 217.90)",
+          "oklch(26.43% 0.0257 217.90)",
+          "oklch(37.86% 0.0257 217.90)",
+          "oklch(49.29% 0.0257 217.90)",
+          "oklch(60.71% 0.0257 217.90)",
+          "oklch(72.14% 0.0257 217.90)",
+          "oklch(83.57% 0.0257 217.90)",
+          "oklch(95% 0.0257 217.90)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Divider Neutral",
+        "tonalRamp": [
+          "oklch(15% 0.0087 205.89)",
+          "oklch(26.43% 0.0087 205.89)",
+          "oklch(37.86% 0.0087 205.89)",
+          "oklch(49.29% 0.0087 205.89)",
+          "oklch(60.71% 0.0087 205.89)",
+          "oklch(72.14% 0.0087 205.89)",
+          "oklch(83.57% 0.0087 205.89)",
+          "oklch(95% 0.0087 205.89)"
+        ]
+      },
+      "control-border": {
+        "role": "neutral",
+        "displayName": "Control Stroke",
+        "tonalRamp": [
+          "oklch(15% 0.0137 214.37)",
+          "oklch(26.43% 0.0137 214.37)",
+          "oklch(37.86% 0.0137 214.37)",
+          "oklch(49.29% 0.0137 214.37)",
+          "oklch(60.71% 0.0137 214.37)",
+          "oklch(72.14% 0.0137 214.37)",
+          "oklch(83.57% 0.0137 214.37)",
+          "oklch(95% 0.0137 214.37)"
+        ]
+      },
+      "control-hover": {
+        "role": "neutral",
+        "displayName": "Control Hover",
+        "tonalRamp": [
+          "oklch(15% 0.0066 208.78)",
+          "oklch(26.43% 0.0066 208.78)",
+          "oklch(37.86% 0.0066 208.78)",
+          "oklch(49.29% 0.0066 208.78)",
+          "oklch(60.71% 0.0066 208.78)",
+          "oklch(72.14% 0.0066 208.78)",
+          "oklch(83.57% 0.0066 208.78)",
+          "oklch(95% 0.0066 208.78)"
+        ]
+      },
+      "control-active": {
+        "role": "neutral",
+        "displayName": "Control Pressed",
+        "tonalRamp": [
+          "oklch(15% 0.0111 211.04)",
+          "oklch(26.43% 0.0111 211.04)",
+          "oklch(37.86% 0.0111 211.04)",
+          "oklch(49.29% 0.0111 211.04)",
+          "oklch(60.71% 0.0111 211.04)",
+          "oklch(72.14% 0.0111 211.04)",
+          "oklch(83.57% 0.0111 211.04)",
+          "oklch(95% 0.0111 211.04)"
+        ]
+      },
+      "focus": {
+        "role": "neutral",
+        "displayName": "Focus Petrol",
+        "tonalRamp": [
+          "oklch(15% 0.0886 209.14)",
+          "oklch(26.43% 0.0886 209.14)",
+          "oklch(37.86% 0.0886 209.14)",
+          "oklch(49.29% 0.0886 209.14)",
+          "oklch(60.71% 0.0886 209.14)",
+          "oklch(72.14% 0.0886 209.14)",
+          "oklch(83.57% 0.0886 209.14)",
+          "oklch(95% 0.0886 209.14)"
+        ]
+      },
+      "chart-observed": {
+        "role": "neutral",
+        "displayName": "Observed Graphite",
+        "tonalRamp": [
+          "oklch(15% 0.0332 219.77)",
+          "oklch(26.43% 0.0332 219.77)",
+          "oklch(37.86% 0.0332 219.77)",
+          "oklch(49.29% 0.0332 219.77)",
+          "oklch(60.71% 0.0332 219.77)",
+          "oklch(72.14% 0.0332 219.77)",
+          "oklch(83.57% 0.0332 219.77)",
+          "oklch(95% 0.0332 219.77)"
+        ]
+      },
+      "chart-prior": {
+        "role": "neutral",
+        "displayName": "Prior Gray",
+        "tonalRamp": [
+          "oklch(15% 0.0237 218.77)",
+          "oklch(26.43% 0.0237 218.77)",
+          "oklch(37.86% 0.0237 218.77)",
+          "oklch(49.29% 0.0237 218.77)",
+          "oklch(60.71% 0.0237 218.77)",
+          "oklch(72.14% 0.0237 218.77)",
+          "oklch(83.57% 0.0237 218.77)",
+          "oklch(95% 0.0237 218.77)"
+        ]
+      },
+      "chart-active": {
+        "role": "neutral",
+        "displayName": "In-use Petrol",
+        "tonalRamp": [
+          "oklch(15% 0.0644 212.92)",
+          "oklch(26.43% 0.0644 212.92)",
+          "oklch(37.86% 0.0644 212.92)",
+          "oklch(49.29% 0.0644 212.92)",
+          "oklch(60.71% 0.0644 212.92)",
+          "oklch(72.14% 0.0644 212.92)",
+          "oklch(83.57% 0.0644 212.92)",
+          "oklch(95% 0.0644 212.92)"
+        ]
+      },
+      "chart-idle": {
+        "role": "semantic",
+        "displayName": "Idle Ochre",
+        "tonalRamp": [
+          "oklch(15% 0.1191 75.10)",
+          "oklch(26.43% 0.1191 75.10)",
+          "oklch(37.86% 0.1191 75.10)",
+          "oklch(49.29% 0.1191 75.10)",
+          "oklch(60.71% 0.1191 75.10)",
+          "oklch(72.14% 0.1191 75.10)",
+          "oklch(83.57% 0.1191 75.10)",
+          "oklch(95% 0.1191 75.10)"
+        ]
+      },
+      "chart-off": {
+        "role": "neutral",
+        "displayName": "Off Mist",
+        "tonalRamp": [
+          "oklch(15% 0.0080 216.63)",
+          "oklch(26.43% 0.0080 216.63)",
+          "oklch(37.86% 0.0080 216.63)",
+          "oklch(49.29% 0.0080 216.63)",
+          "oklch(60.71% 0.0080 216.63)",
+          "oklch(72.14% 0.0080 216.63)",
+          "oklch(83.57% 0.0080 216.63)",
+          "oklch(95% 0.0080 216.63)"
+        ]
+      },
+      "warning": {
+        "role": "semantic",
+        "displayName": "Warning Amber",
+        "tonalRamp": [
+          "oklch(15% 0.0986 71.38)",
+          "oklch(26.43% 0.0986 71.38)",
+          "oklch(37.86% 0.0986 71.38)",
+          "oklch(49.29% 0.0986 71.38)",
+          "oklch(60.71% 0.0986 71.38)",
+          "oklch(72.14% 0.0986 71.38)",
+          "oklch(83.57% 0.0986 71.38)",
+          "oklch(95% 0.0986 71.38)"
+        ]
+      },
+      "warning-bg": {
+        "role": "semantic",
+        "displayName": "Warning Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0227 84.59)",
+          "oklch(26.43% 0.0227 84.59)",
+          "oklch(37.86% 0.0227 84.59)",
+          "oklch(49.29% 0.0227 84.59)",
+          "oklch(60.71% 0.0227 84.59)",
+          "oklch(72.14% 0.0227 84.59)",
+          "oklch(83.57% 0.0227 84.59)",
+          "oklch(95% 0.0227 84.59)"
+        ]
+      },
+      "error": {
+        "role": "semantic",
+        "displayName": "Error Red",
+        "tonalRamp": [
+          "oklch(15% 0.1498 18.35)",
+          "oklch(26.43% 0.1498 18.35)",
+          "oklch(37.86% 0.1498 18.35)",
+          "oklch(49.29% 0.1498 18.35)",
+          "oklch(60.71% 0.1498 18.35)",
+          "oklch(72.14% 0.1498 18.35)",
+          "oklch(83.57% 0.1498 18.35)",
+          "oklch(95% 0.1498 18.35)"
+        ]
+      },
+      "badge-neutral-bg": {
+        "role": "semantic",
+        "displayName": "Neutral Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0045 214.33)",
+          "oklch(26.43% 0.0045 214.33)",
+          "oklch(37.86% 0.0045 214.33)",
+          "oklch(49.29% 0.0045 214.33)",
+          "oklch(60.71% 0.0045 214.33)",
+          "oklch(72.14% 0.0045 214.33)",
+          "oklch(83.57% 0.0045 214.33)",
+          "oklch(95% 0.0045 214.33)"
+        ]
+      },
+      "badge-neutral-ink": {
+        "role": "semantic",
+        "displayName": "Neutral Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.0275 220.11)",
+          "oklch(26.43% 0.0275 220.11)",
+          "oklch(37.86% 0.0275 220.11)",
+          "oklch(49.29% 0.0275 220.11)",
+          "oklch(60.71% 0.0275 220.11)",
+          "oklch(72.14% 0.0275 220.11)",
+          "oklch(83.57% 0.0275 220.11)",
+          "oklch(95% 0.0275 220.11)"
+        ]
+      },
+      "badge-warning-bg": {
+        "role": "semantic",
+        "displayName": "Warning Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0366 80.63)",
+          "oklch(26.43% 0.0366 80.63)",
+          "oklch(37.86% 0.0366 80.63)",
+          "oklch(49.29% 0.0366 80.63)",
+          "oklch(60.71% 0.0366 80.63)",
+          "oklch(72.14% 0.0366 80.63)",
+          "oklch(83.57% 0.0366 80.63)",
+          "oklch(95% 0.0366 80.63)"
+        ]
+      },
+      "badge-warning-ink": {
+        "role": "semantic",
+        "displayName": "Warning Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.0955 68.67)",
+          "oklch(26.43% 0.0955 68.67)",
+          "oklch(37.86% 0.0955 68.67)",
+          "oklch(49.29% 0.0955 68.67)",
+          "oklch(60.71% 0.0955 68.67)",
+          "oklch(72.14% 0.0955 68.67)",
+          "oklch(83.57% 0.0955 68.67)",
+          "oklch(95% 0.0955 68.67)"
+        ]
+      },
+      "badge-estimated-bg": {
+        "role": "semantic",
+        "displayName": "Estimated Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0060 223.46)",
+          "oklch(26.43% 0.0060 223.46)",
+          "oklch(37.86% 0.0060 223.46)",
+          "oklch(49.29% 0.0060 223.46)",
+          "oklch(60.71% 0.0060 223.46)",
+          "oklch(72.14% 0.0060 223.46)",
+          "oklch(83.57% 0.0060 223.46)",
+          "oklch(95% 0.0060 223.46)"
+        ]
+      },
+      "badge-estimated-ink": {
+        "role": "semantic",
+        "displayName": "Estimated Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.0426 227.81)",
+          "oklch(26.43% 0.0426 227.81)",
+          "oklch(37.86% 0.0426 227.81)",
+          "oklch(49.29% 0.0426 227.81)",
+          "oklch(60.71% 0.0426 227.81)",
+          "oklch(72.14% 0.0426 227.81)",
+          "oklch(83.57% 0.0426 227.81)",
+          "oklch(95% 0.0426 227.81)"
+        ]
+      },
+      "badge-pass-bg": {
+        "role": "semantic",
+        "displayName": "Pass Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0175 164.65)",
+          "oklch(26.43% 0.0175 164.65)",
+          "oklch(37.86% 0.0175 164.65)",
+          "oklch(49.29% 0.0175 164.65)",
+          "oklch(60.71% 0.0175 164.65)",
+          "oklch(72.14% 0.0175 164.65)",
+          "oklch(83.57% 0.0175 164.65)",
+          "oklch(95% 0.0175 164.65)"
+        ]
+      },
+      "badge-pass-ink": {
+        "role": "semantic",
+        "displayName": "Pass Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.0774 163.32)",
+          "oklch(26.43% 0.0774 163.32)",
+          "oklch(37.86% 0.0774 163.32)",
+          "oklch(49.29% 0.0774 163.32)",
+          "oklch(60.71% 0.0774 163.32)",
+          "oklch(72.14% 0.0774 163.32)",
+          "oklch(83.57% 0.0774 163.32)",
+          "oklch(95% 0.0774 163.32)"
+        ]
+      },
+      "badge-fail-bg": {
+        "role": "semantic",
+        "displayName": "Fail Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0198 9.78)",
+          "oklch(26.43% 0.0198 9.78)",
+          "oklch(37.86% 0.0198 9.78)",
+          "oklch(49.29% 0.0198 9.78)",
+          "oklch(60.71% 0.0198 9.78)",
+          "oklch(72.14% 0.0198 9.78)",
+          "oklch(83.57% 0.0198 9.78)",
+          "oklch(95% 0.0198 9.78)"
+        ]
+      },
+      "badge-fail-ink": {
+        "role": "semantic",
+        "displayName": "Fail Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.1468 16.21)",
+          "oklch(26.43% 0.1468 16.21)",
+          "oklch(37.86% 0.1468 16.21)",
+          "oklch(49.29% 0.1468 16.21)",
+          "oklch(60.71% 0.1468 16.21)",
+          "oklch(72.14% 0.1468 16.21)",
+          "oklch(83.57% 0.1468 16.21)",
+          "oklch(95% 0.1468 16.21)"
+        ]
+      },
+      "badge-advisory-bg": {
+        "role": "semantic",
+        "displayName": "Advisory Badge Surface",
+        "tonalRamp": [
+          "oklch(15% 0.0025 228.78)",
+          "oklch(26.43% 0.0025 228.78)",
+          "oklch(37.86% 0.0025 228.78)",
+          "oklch(49.29% 0.0025 228.78)",
+          "oklch(60.71% 0.0025 228.78)",
+          "oklch(72.14% 0.0025 228.78)",
+          "oklch(83.57% 0.0025 228.78)",
+          "oklch(95% 0.0025 228.78)"
+        ]
+      },
+      "badge-advisory-ink": {
+        "role": "semantic",
+        "displayName": "Advisory Badge Text",
+        "tonalRamp": [
+          "oklch(15% 0.0223 221.10)",
+          "oklch(26.43% 0.0223 221.10)",
+          "oklch(37.86% 0.0223 221.10)",
+          "oklch(49.29% 0.0223 221.10)",
+          "oklch(60.71% 0.0223 221.10)",
+          "oklch(72.14% 0.0223 221.10)",
+          "oklch(83.57% 0.0223 221.10)",
+          "oklch(95% 0.0223 221.10)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Page heading",
+        "purpose": "Primary route title."
+      },
+      "headline": {
+        "displayName": "Panel heading",
+        "purpose": "Analytical section title."
+      },
+      "title": {
+        "displayName": "Subsection heading",
+        "purpose": "Evidence or guidance subsection."
+      },
+      "body": {
+        "displayName": "Interface body",
+        "purpose": "General interface language."
+      },
+      "label": {
+        "displayName": "Metric label",
+        "purpose": "Compact financial measure labels."
+      },
+      "data": {
+        "displayName": "Technical data",
+        "purpose": "Tabular values, units, code and evidence; tabular numerals."
+      },
+      "metric": {
+        "displayName": "Financial value",
+        "purpose": "Prominent metric values with responsive size changes."
+      }
+    },
+    "shadows": [
+      {
+        "name": "floating-menu",
+        "value": "0 8px 30px #24343926",
+        "purpose": "Separate the language dropdown from the flat work surface."
+      }
+    ],
+    "motion": [
+      {
+        "name": "control-feedback",
+        "value": "background 0.16s ease-out, color 0.16s ease-out",
+        "purpose": "Default button hover/pressed feedback."
+      },
+      {
+        "name": "sidebar-drawer",
+        "value": "transform 0.18s ease-out",
+        "purpose": "Off-canvas navigation movement at or below 850px."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "animation: none !important; transition: none !important; scroll-behavior: auto !important",
+        "purpose": "Applied globally under prefers-reduced-motion: reduce; charts also disable entry animation."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "phone-max",
+        "value": "560px"
+      },
+      {
+        "name": "drawer-max",
+        "value": "850px"
+      },
+      {
+        "name": "compact-desktop-max",
+        "value": "1190px"
+      },
+      {
+        "name": "wide-min",
+        "value": "1550px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Neutral retry, reset or secondary action.",
+      "html": "<button class=\"ds-button-default\" type=\"button\">Retry</button>",
+      "css": ".ds-button-default { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 7px 12px; border: 1px solid #c7d3d6; border-radius: 6px; background: var(--surface, #fff); color: var(--ink, #243439); font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 14px; line-height: 1.5; font-weight: 550; cursor: pointer; transition: background 0.16s ease-out, color 0.16s ease-out; } .ds-button-default:hover:not(:disabled) { background: #e9eff0; } .ds-button-default:active:not(:disabled) { background: #dce6e8; } .ds-button-default:disabled { cursor: not-allowed; opacity: 0.45; } .ds-button-default:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-button-default { transition: none; } }"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Petrol action treatment; illustrative label from the resource workflow.",
+      "html": "<a class=\"ds-button-primary\" href=\"#databricks\">Open in Databricks <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M7 7h10v10M7 17 17 7\"/></svg></a>",
+      "css": ".ds-button-primary { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 7px 12px; font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 12px; line-height: 1.5; font-weight: 550; border-radius: 6px; color: white; background: var(--accent, #115e67); border-color: var(--accent, #115e67); text-decoration: none; text-underline-offset: 3px; touch-action: manipulation; } .ds-button-primary:hover:not(:disabled) { color: #fff; background: var(--accent-hover, #0c4c54); text-decoration: none; } .ds-button-primary:active { color: var(--accent-hover, #0c4c54); } .ds-button-primary:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } .ds-button-primary svg { flex-shrink: 0; vertical-align: middle; }"
+    },
+    {
+      "name": "Subtle Button",
+      "kind": "button",
+      "refersTo": "button-subtle",
+      "description": "Low-emphasis filter-reset action.",
+      "html": "<button class=\"ds-button-subtle\" type=\"button\">Clear filters</button>",
+      "css": ".ds-button-subtle { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 7px 12px; border: 1px solid #c7d3d6; border-radius: 6px; background: var(--surface, #fff); color: var(--ink, #243439); font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 14px; line-height: 1.5; font-weight: 550; cursor: pointer; transition: background 0.16s ease-out, color 0.16s ease-out; } .ds-button-subtle:hover:not(:disabled) { background: #e9eff0; } .ds-button-subtle:active:not(:disabled) { background: #dce6e8; } .ds-button-subtle:disabled { cursor: not-allowed; opacity: 0.45; } .ds-button-subtle:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-button-subtle { transition: none; } } .ds-button-subtle { border-color: transparent; background: transparent; font-size: 11px; color: var(--muted, #596d73); }"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "Compact toolbar refresh action with an accessible name.",
+      "html": "<button class=\"ds-button-icon\" type=\"button\" aria-label=\"Refresh\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"17\" height=\"17\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M3 12a9 9 0 0 1 15.36-6.36L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.36 6.36L3 16M8 16H3v5\"/></svg></button>",
+      "css": ".ds-button-icon { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 7px 12px; border: 1px solid #c7d3d6; border-radius: 6px; background: var(--surface, #fff); color: var(--ink, #243439); font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 14px; line-height: 1.5; font-weight: 550; cursor: pointer; transition: background 0.16s ease-out, color 0.16s ease-out; } .ds-button-icon:hover:not(:disabled) { background: #e9eff0; } .ds-button-icon:active:not(:disabled) { background: #dce6e8; } .ds-button-icon:disabled { cursor: not-allowed; opacity: 0.45; } .ds-button-icon:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } @media (prefers-reduced-motion: reduce) { .ds-button-icon { transition: none; } } .ds-button-icon { min-height: 34px; width: 34px; padding: 6px; border: 0; background: transparent; color: #60757c; } .ds-button-icon svg { flex-shrink: 0; vertical-align: middle; }"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Single stroked search container from opportunity filtering.",
+      "html": "<label class=\"ds-search\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><circle cx=\"11\" cy=\"11\" r=\"8\"/><path d=\"m21 21-4.3-4.3\"/></svg><input type=\"search\" aria-label=\"Search resources\" placeholder=\"Search resources\" /></label>",
+      "css": ".ds-search { display: flex; align-items: center; gap: 8px; flex: 1 1 290px; color: #6c8087; background: #fff; border: 1px solid #c7d3d6; border-radius: 6px; padding: 0 10px; } .ds-search:focus-within { outline: 2px solid var(--accent, #115e67); outline-offset: 1px; } .ds-search input { width: 100%; min-width: 0; min-height: 36px; border: none; border-radius: 6px; outline: none; background: transparent; padding: 8px 0; color: var(--ink, #243439); font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 12px; line-height: 1.5; caret-color: var(--accent, #115e67); } .ds-search input::placeholder { color: #62767c; } .ds-search svg { flex-shrink: 0; }"
+    },
+    {
+      "name": "Navigation",
+      "kind": "nav",
+      "refersTo": "navigation-selected",
+      "description": "Icon-and-label rows with the implemented active route treatment.",
+      "html": "<nav class=\"ds-nav\" aria-label=\"Navigation\"><a class=\"ds-nav-link ds-nav-active\" href=\"#overview\" aria-current=\"page\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"9\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"5\" rx=\"1\"/><rect x=\"14\" y=\"12\" width=\"7\" height=\"9\" rx=\"1\"/><rect x=\"3\" y=\"16\" width=\"7\" height=\"5\" rx=\"1\"/></svg><span>Overview</span></a><a class=\"ds-nav-link\" href=\"#opportunities\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"18\" height=\"18\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"9\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"5\" rx=\"1\"/><rect x=\"14\" y=\"12\" width=\"7\" height=\"9\" rx=\"1\"/><rect x=\"3\" y=\"16\" width=\"7\" height=\"5\" rx=\"1\"/></svg><span>Opportunities</span></a></nav>",
+      "css": ".ds-nav { background: var(--sidebar, #eef2f2); padding: 0 3px 14px; font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; line-height: 1.5; } .ds-nav-link { display: flex; align-items: center; gap: 11px; color: #52676e; padding: 9px 12px; border-radius: 6px; font-size: 13px; font-weight: 550; min-height: 39px; margin: 2px 0; text-decoration: none; } .ds-nav-link:hover { background: #e2e9ea; text-decoration: none; color: var(--ink, #243439); } .ds-nav-link:active { color: var(--accent-hover, #0c4c54); } .ds-nav-link.ds-nav-active { background: var(--selected, #dcebee); color: #0c505b; font-weight: 650; } .ds-nav-link svg { flex-shrink: 0; } .ds-nav-link:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } @media (max-width: 850px) { .ds-nav-link { font-size: 14px; padding-top: 11px; padding-bottom: 11px; } }"
+    },
+    {
+      "name": "Status Badges",
+      "kind": "chip",
+      "refersTo": "badge",
+      "description": "Passive labeled semantic states; no interaction is implied.",
+      "html": "<div class=\"ds-badges\"><span class=\"ds-badge\">Neutral</span> <span class=\"ds-badge ds-badge-high\">High</span> <span class=\"ds-badge ds-badge-estimated\">Estimated</span> <span class=\"ds-badge ds-badge-pass\">Pass</span> <span class=\"ds-badge ds-badge-fail\">Fail</span> <span class=\"ds-badge ds-badge-advisory\">Advisory</span></div>",
+      "css": ".ds-badges { font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; } .ds-badge { display: inline-flex; align-items: center; font-size: 10px; line-height: 1.4; font-weight: 550; border-radius: 4px; padding: 3px 7px; background: #edf1f2; color: #52676e; white-space: nowrap; } .ds-badge-high { background: #fff0d7; color: #805214; } .ds-badge-estimated { background: #edf2f4; color: #456472; } .ds-badge-pass { background: #e4f2eb; color: #2c6a50; } .ds-badge-fail { background: #fbe9eb; color: #a33343; } .ds-badge-advisory { background: #eff1f2; color: #596d73; }"
+    },
+    {
+      "name": "Analytical Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "Flat work surface with a restrained heading and supporting context.",
+      "html": "<section class=\"ds-panel\" aria-labelledby=\"ds-panel-title\"><header class=\"ds-section-heading\"><div><h2 id=\"ds-panel-title\">Daily spend</h2><p>Observed usage · USD</p></div><span class=\"ds-data-unit\">USD</span></header></section>",
+      "css": ".ds-panel { background: var(--surface, #fff); color: var(--ink, #243439); border: 1px solid var(--line, #dce4e5); border-radius: var(--radius, 12px); padding: 22px 24px; margin-bottom: 24px; min-width: 0; font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; font-size: 14px; line-height: 1.5; } .ds-section-heading { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 18px; } .ds-section-heading h2 { margin: 0; font-size: 17px; line-height: 1.4; font-weight: 650; letter-spacing: -0.012em; } .ds-section-heading p { margin: 5px 0 0; font-size: 11px; color: var(--muted, #596d73); max-width: 75ch; } .ds-data-unit { font-family: \"JetBrains Mono\", \"IBM Plex Mono\", monospace; font-variant-numeric: tabular-nums; font-size: 11px; color: var(--muted, #596d73); } @media (max-width: 560px) { .ds-panel { padding: 18px 16px; margin-bottom: 20px; } .ds-section-heading { align-items: flex-start; gap: 12px; flex-wrap: wrap; } .ds-section-heading h2 { font-size: 16px; } .ds-section-heading p { font-size: 10px; line-height: 1.6; } }"
+    },
+    {
+      "name": "Financial Metric Strip",
+      "kind": "custom",
+      "refersTo": "metric",
+      "description": "Description-list metrics with financial context; all values are illustrative preview content.",
+      "html": "<dl class=\"ds-metrics\"><div class=\"ds-metric\"><dt>Monthly spend</dt><dd>$12,400.00</dd><p>Last 30 days · observed usage</p></div><div class=\"ds-metric ds-metric-accent\"><dt>Estimated monthly opportunity</dt><dd>$1,240.00</dd><p>Monthly estimate · high confidence · not guaranteed savings</p></div><div class=\"ds-metric\"><dt>Tracked savings</dt><dd>$310.00</dd><p>Aug 2 – Oct 20 · configuration-change estimate · not an invoice</p></div></dl>",
+      "css": ".ds-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-top: 1px solid var(--line, #dce4e5); border-bottom: 1px solid var(--line, #dce4e5); padding: 23px 0; margin: 0 0 28px; gap: 25px; color: var(--ink, #243439); font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; line-height: 1.5; } .ds-metric { padding-right: 18px; min-width: 0; } .ds-metric + .ds-metric { border-left: 1px solid var(--line, #dce4e5); padding-left: 25px; } .ds-metric dt { font-size: 13px; font-weight: 550; color: #5c7077; line-height: 1.4; } .ds-metric dd { font-family: \"JetBrains Mono\", \"IBM Plex Mono\", monospace; font-variant-numeric: tabular-nums; font-size: 1.75rem; font-weight: 500; letter-spacing: -0.035em; line-height: 1.3; margin: 10px 0; overflow-wrap: anywhere; } .ds-metric-accent dd { color: var(--accent, #115e67); } .ds-metric p { margin: 0; color: var(--muted, #596d73); font-size: 11px; line-height: 1.6; max-width: 52ch; } @media (min-width: 1550px) { .ds-metric dd { font-size: 30px; } } @media (max-width: 1190px) { .ds-metrics { gap: 15px; } .ds-metric + .ds-metric { padding-left: 18px; } .ds-metric dd { font-size: 22px; } .ds-metric p { font-size: 10px; } } @media (max-width: 560px) { .ds-metrics { grid-template-columns: 1fr; padding: 0; gap: 0; margin-bottom: 22px; } .ds-metric, .ds-metric + .ds-metric { padding: 17px 0; border-left: 0; display: grid; grid-template-columns: 1fr auto; gap: 5px 14px; } .ds-metric + .ds-metric { border-top: 1px solid var(--line, #dce4e5); } .ds-metric dt { font-size: 12px; align-self: center; max-width: 24ch; } .ds-metric dd { font-size: 22px; margin: 0; text-align: right; align-self: center; } .ds-metric p { grid-column: 1/-1; font-size: 10px; max-width: 100%; } }"
+    },
+    {
+      "name": "Resource Table",
+      "kind": "custom",
+      "description": "Named, focusable horizontal table region with technical metadata and aligned values; row content is illustrative.",
+      "html": "<div class=\"ds-table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"Prioritized resources\"><table class=\"ds-table\"><caption class=\"ds-sr-only\">Prioritized resources</caption><thead><tr><th scope=\"col\">Resource</th><th scope=\"col\">Recommended action</th><th scope=\"col\" class=\"ds-numeric\">Monthly estimate (USD)</th></tr></thead><tbody><tr><td><a class=\"ds-resource-link\" href=\"#resource\">Analytics warehouse <svg xmlns=\"http://www.w3.org/2000/svg\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M7 7h10v10M7 17 17 7\"/></svg></a><span class=\"ds-cell-sub\"><code>warehouse-123</code> · Production</span></td><td><span class=\"ds-action-label\">Review idle time and auto-stop</span></td><td class=\"ds-numeric ds-opportunity\">$420.00</td></tr></tbody></table></div>",
+      "css": ".ds-table-scroll { overflow: auto; max-width: 100%; outline-offset: -3px; font-family: \"Instrument Sans Variable\", \"IBM Plex Sans\", sans-serif; line-height: 1.5; color: var(--ink, #243439); } .ds-table { width: 100%; border-collapse: collapse; text-align: left; font-size: 12px; } .ds-table th { background: #f9fbfb; font-weight: 550; color: #63777e; font-size: 10px; padding: 12px 18px; border-top: 1px solid var(--line, #dce4e5); border-bottom: 1px solid var(--line, #dce4e5); white-space: nowrap; } .ds-table td { padding: 16px 18px; border-bottom: 1px solid #e8edee; vertical-align: middle; } .ds-table th:first-child, .ds-table td:first-child { padding-left: 24px; } .ds-table th:last-child, .ds-table td:last-child { padding-right: 24px; } .ds-table tbody tr:last-child td { border-bottom: none; } .ds-table tbody tr:hover { background: #fafcfc; } .ds-table .ds-numeric { font-family: \"JetBrains Mono\", \"IBM Plex Mono\", monospace; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; font-size: 11px; } .ds-resource-link { display: flex; align-items: center; gap: 8px; font-weight: 600; color: #284d58; min-width: 140px; overflow-wrap: anywhere; text-decoration: none; text-underline-offset: 3px; } .ds-resource-link:hover { text-decoration: underline; } .ds-resource-link:active { color: var(--accent-hover, #0c4c54); } .ds-resource-link svg { color: #8b9ca1; flex-shrink: 0; } .ds-cell-sub { display: block; font-size: 10px; color: var(--muted, #596d73); margin-top: 5px; } .ds-cell-sub code { font-family: \"JetBrains Mono\", \"IBM Plex Mono\", monospace; font-variant-numeric: tabular-nums; font-size: 10px; overflow-wrap: anywhere; } .ds-action-label { display: block; max-width: 32ch; min-width: 150px; line-height: 1.45; } .ds-opportunity { color: var(--accent, #115e67); } .ds-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; } .ds-resource-link:focus-visible { outline: 3px solid #218492; outline-offset: 3px; } .ds-table-scroll:focus-visible { outline: 3px solid #218492; outline-offset: -3px; } @media (max-width: 560px) { .ds-table th, .ds-table td { padding-left: 14px; padding-right: 14px; } .ds-table th:first-child, .ds-table td:first-child { padding-left: 16px; } .ds-table th:last-child, .ds-table td:last-child { padding-right: 16px; } .ds-resource-link { min-width: 145px; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Analytical Workbench",
+    "overview": "BrickPulse uses a light, precise workbench for engineers investigating Databricks spend and leaders reading the same evidence at a glance. Cool neutral surroundings, white work surfaces, graphite text and a petrol accent make financial facts, priorities and resource relationships easy to scan. Density comes from compact typography, aligned values and restrained dividers.\n\nThe visual system keeps explanation beside the number: scope, period, confidence, source and freshness remain legible context. Panels organize evidence without decorative depth. The original Frequência mark provides identity through five rounded bars in Logo Orange; charts, tables and text provide the substance. The implemented interface requires no photographic or illustrative raster assets.",
+    "keyCharacteristics": [
+      "Light neutral canvas and white analytical surfaces.",
+      "Graphite reading text with petrol actions, selection and opportunity values.",
+      "The original five-bar Frequência logo in orange, separate from the petrol interface accent.",
+      "Instrument Sans for interface language; JetBrains Mono for values and technical evidence.",
+      "Flat panels, precise dividers and compact controls.",
+      "Explicit financial context, honest unavailable states and accessible data alternatives."
+    ],
+    "rules": [
+      {
+        "name": "The Meaning Rule",
+        "body": "Use petrol for actions, selection and opportunity emphasis; retain graphite for the implemented observed data series. A color alone must not establish whether a value is observed, estimated, unavailable or synthetic.",
+        "section": "colors"
+      },
+      {
+        "name": "The Display and Data Rule",
+        "body": "Keep interface language in Instrument Sans and comparable values or technical evidence in JetBrains Mono. Right-align numeric table cells and retain tabular numerals.",
+        "section": "typography"
+      },
+      {
+        "name": "The Locale Rule",
+        "body": "Format visible currency, numbers and dates for pt-BR, English or Spanish while keeping USD and the underlying calculations independent of language. Preserve text wrapping for localized labels.",
+        "section": "typography"
+      },
+      {
+        "name": "The Table Continuity Rule",
+        "body": "Preserve the table's columns in a horizontally scrollable, focusable region with an accessible caption/name. Keep numeric values unbroken and aligned; do not remove evidence columns to make a phone screenshot fit. The current review confirmed this structure in source but did not exercise scrolling or keyboard behavior.",
+        "section": "layout"
+      },
+      {
+        "name": "The Structural Depth Rule",
+        "body": "Use borders and surface tones for analytical grouping; reserve the existing shadow for the floating menu.",
+        "section": "elevation & depth"
+      },
+      {
+        "name": "The Shape Hierarchy Rule",
+        "body": "Keep work surfaces, controls and status tags on their existing separate corner sizes; this small hierarchy supplies the workbench's form language.",
+        "section": "shapes"
+      },
+      {
+        "name": "The Original Logo Rule",
+        "body": "Use the exact original Frequência symbol from `frontend/logo-options/svg/03-frequencia-symbol-color.svg`, preserving all five rounded bars, their positions and Logo Orange. The sidebar and favicon use the same SVG; do not redraw, recolor or combine the approved symbol with another mark.",
+        "section": "shapes"
+      },
+      {
+        "name": "The Evidence Rule",
+        "body": "Keep period, source, confidence, freshness and estimate caveats close to the amount they explain. Preserve visible demo labeling and distinguish estimated opportunity from observed spend or tracked changes; never imply an invoice or guaranteed saving.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do preserve the cool neutral canvas, white surfaces, graphite text and petrol action/selection accent.",
+      "Do separate interface typography from tabular numeric and technical typography.",
+      "Do keep financial period, source, confidence, freshness and estimate caveats beside their values.",
+      "Do retain meaningful status text, visible focus and horizontal access to complete tables.",
+      "Do carry workspace scope and localized formatting consistently between routes."
+    ],
+    "donts": [
+      "Don't render missing information as zero spend or no opportunity.",
+      "Don't present estimates as invoices, guaranteed savings or executed resource changes.",
+      "Don't rely on color alone to distinguish observed, estimated, unavailable or demo information.",
+      "Don't replace the flat panel hierarchy with decorative elevation.",
+      "Don't remove financial context or evidence columns to compress a narrow layout."
+    ]
+  }
+}

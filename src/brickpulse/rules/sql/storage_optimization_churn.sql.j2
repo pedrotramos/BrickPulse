@@ -1,0 +1,98 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: storage_optimization_churn  (storage lifecycle)
+--
+-- FORMULA HEADER
+--   cost basis:      ESTIMATED_DBU, as reported by Predictive Optimization itself.
+--                    system.storage.predictive_optimization_operations_history records
+--                    the DBUs PO spent maintaining each table. We report those DBUs; we
+--                    do NOT convert to dollars here (PO bills under its own SKU and the
+--                    per-table dollar split is not reliably reconstructable from these
+--                    tables), so this is an OPERATIONAL finding: $0 booked / addressable.
+--   units:           estimated DBUs PO consumed per table over the window; operation
+--                    counts by type (COMPACTION / CLUSTERING / VACUUM / ...).
+--   counterfactual:  a table PO must maintain HEAVILY (repeated compaction/clustering,
+--                    high DBUs) is usually being written in a fragmenting pattern —
+--                    frequent tiny appends or churny MERGEs that force constant
+--                    re-optimization. Fixing the write pattern (batch writes, better
+--                    clustering/partitioning) cuts BOTH the PO maintenance cost and the
+--                    query cost. Not every heavy table is fixable, so it is advisory.
+--   savings_status:  advisory ($0 booked, operational). Experimental / Labs.
+--
+-- DETECTION: sum the estimated DBUs and count operations PO ran per table over the
+-- window; surface the dominant operation type so a reader knows whether it is
+-- compaction (small-file churn), clustering, or vacuum dominating.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH po AS (
+  SELECT
+    workspace_id,
+    table_id,
+    catalog_name,
+    schema_name,
+    table_name,
+    operation_type,
+    CAST(start_time AS DATE) AS day,
+    COALESCE(usage_quantity, 0) AS dbus
+  FROM {{ tbl('storage','predictive_optimization_operations_history') }}
+  WHERE table_id IS NOT NULL
+    AND {{ m.window_lower('start_time') }}
+),
+per_table AS (
+  SELECT
+    workspace_id,
+    table_id,
+    MAX(concat_ws('.', catalog_name, schema_name, table_name)) AS table_full_name,
+    COUNT(*) AS operations,
+    COUNT(DISTINCT day) AS observed_days,
+    SUM(dbus) AS po_dbus,
+    SUM(CASE WHEN operation_type = 'COMPACTION' THEN dbus ELSE 0 END) AS compaction_dbus,
+    SUM(CASE WHEN operation_type = 'CLUSTERING' THEN dbus ELSE 0 END) AS clustering_dbus,
+    SUM(CASE WHEN operation_type = 'VACUUM' THEN dbus ELSE 0 END) AS vacuum_dbus
+  FROM po
+  GROUP BY 1, 2
+  HAVING SUM(dbus) >= {{ min_po_dbus }}
+),
+-- The dominant PO operation type per table, for the "why".
+op_totals AS (
+  SELECT workspace_id, table_id, operation_type, SUM(dbus) AS d
+  FROM po GROUP BY 1, 2, 3
+),
+top_op AS (
+  SELECT workspace_id, table_id, operation_type AS top_operation, d AS top_operation_dbus
+  FROM op_totals
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, table_id ORDER BY d DESC
+  ) = 1
+),
+-- Per-day PO DBUs, for the chart.
+daily AS (
+  SELECT workspace_id, table_id, day, SUM(dbus) AS dbus
+  FROM po GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, table_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, dbus AS n)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'n', ROUND(x.n, 2))
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+)
+SELECT
+  p.workspace_id,
+  p.table_id,
+  p.table_full_name,
+  p.operations,
+  p.observed_days,
+  ROUND(p.po_dbus, 2) AS po_dbus,
+  ROUND(p.compaction_dbus, 2) AS compaction_dbus,
+  ROUND(p.clustering_dbus, 2) AS clustering_dbus,
+  ROUND(p.vacuum_dbus, 2) AS vacuum_dbus,
+  t.top_operation,
+  ROUND(t.top_operation_dbus, 2) AS top_operation_dbus,
+  da.days
+FROM per_table p
+LEFT JOIN top_op t USING (workspace_id, table_id)
+LEFT JOIN daily_arr da USING (workspace_id, table_id)

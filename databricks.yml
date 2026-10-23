@@ -1,0 +1,75 @@
+# BrickPulse as a Declarative Automation Bundle. No target is the default and no
+# workspace value lives here: pick the workspace with --profile and the target with -t,
+# and supply catalog/warehouse_id via --var or .databricks/bundle/<target>/variable-overrides.json
+# (scripts/deploy.py writes it after its preflight).
+bundle:
+  name: brickpulse
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Existing Unity Catalog catalog for the BrickPulse schema
+  warehouse_id:
+    description: Existing SQL warehouse ID the app queries through
+  schema:
+    description: Schema for BrickPulse tables (created by scripts/deploy.py, never by the bundle)
+    default: brickpulse
+  app_name:
+    description: Lowercase, digits and hyphens, at most 30 characters
+    default: brickpulse
+  lookback_days:
+    description: Days of system-table history each refresh reads (1-90)
+    default: "30"
+  pricing_mode:
+    description: "Price source: auto, list or account"
+    default: auto
+  disabled_rules:
+    # Never empty: Apps rejects an environment variable without a value.
+    description: Comma-separated rule ids switched off because their system tables are unreadable, or none
+    default: none
+  apps_tab:
+    description: Show the Apps tab ("true"/"false")
+    default: "false"
+  genie_costs_tab:
+    description: Show the Genie Costs tab ("true"/"false")
+    default: "false"
+
+artifacts:
+  brickpulse_wheel:
+    type: whl
+    build: python3 scripts/build_wheel.py
+    path: .
+
+sync:
+  # Patterns match at any depth (the CLI drops a leading "/"), so never name a directory
+  # that also exists under src/: the app runs from these synced sources.
+  exclude:
+    - .venv/**
+    - frontend/**
+    - node_modules/**
+    - .impeccable/**
+    - tests/**
+    - docs/**
+    - scripts/**
+    - release/**
+    - build/**
+    - "*.md"
+    - package.json
+    - requirements.lock
+    - .pytest_cache/**
+    - "**/__pycache__/**"
+    - "**/*.pyc"
+
+targets:
+  dev:
+    mode: development
+    variables:
+      schema: brickpulse_dev
+      app_name: brickpulse-dev
+  prod:
+    mode: production
+    workspace:
+      # Private to the deploying user; never /Shared.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

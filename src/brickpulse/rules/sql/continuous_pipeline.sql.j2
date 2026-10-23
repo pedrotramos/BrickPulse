@@ -1,0 +1,237 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: continuous_pipeline
+-- DLT / Lakeflow Declarative Pipelines running in CONTINUOUS mode that do not
+-- actually need to: their compute is up (and billing) around the clock, but the
+-- work arrives in bursts a TRIGGERED schedule would cover.
+--
+-- WHY THIS RULE EXISTS
+--   Pipelines were the largest completely unruled slice of spend. Verified on a
+--   live account: 359 DLT pipelines, ~$16.4k/mo, and no rule looked at any of
+--   them. Within that, continuous mode is where the money is — 3 continuous
+--   pipelines accounted for 72% of DLT spend, one of them billing 729 of 729
+--   possible hours in the window off only 108 updates.
+--
+-- THE SIGNAL — hours BILLED vs hours DOING SOMETHING.
+--   A continuous pipeline holds compute up permanently, so it bills every hour of
+--   every day whether or not data arrives. A triggered pipeline bills only while an
+--   update runs. So the waste is the billed hours in which nothing ran, and the
+--   evidence for it is a direct count from two tables:
+--     * billed hours  <- billing.usage (distinct hours with DLT usage)
+--     * active hours  <- lakeflow.pipeline_update_timeline (distinct hours an
+--                        update was in flight)
+--   `idle_hours = billed - active` is measured, not modelled. score() prices only
+--   that measured idle portion.
+--
+--   MEASUREMENT CEILING: "idle" here is "no update in flight", NOT "no
+--   input data arrived". Telling a genuinely no-input hour apart from useful-but-
+--   quiet processing would need per-pipeline input-row metrics, which live only in
+--   each pipeline's Pipeline Events event_log — there is NO account-wide system
+--   table for them (system.lakeflow has no pipeline_events). So this rule does not
+--   attempt that distinction; it keeps the saving ESTIMATED and relies on the
+--   min_idle_hours_frac gate to drop genuinely-streaming pipelines.
+--
+--   VERIFIED that idle hours really cost full rate. On the top live candidate over
+--   7 days: hours with no update in flight burned an average 5.82 DBU/h (min 5.72,
+--   max 6.05) against 5.69 DBU/h for hours with an update running. The pipeline
+--   pays essentially the full rate to sit doing nothing, so pricing idle hours at
+--   the observed blended rate is right rather than optimistic — this is not a case
+--   where "idle" merely means "cheaper".
+--
+--   NOT flagged (each would be a false positive):
+--     * DEVELOPMENT-mode pipelines — compute is expected to stay warm while someone
+--       iterates, and this is not a production cost pattern.
+--     * pipelines whose updates cover most of the billed window — genuinely
+--       streaming, so continuous mode is the correct configuration and switching
+--       would break the latency requirement it exists to meet.
+--     * deleted pipelines (delete_time IS NOT NULL) — nothing left to reconfigure.
+--
+-- LATENCY IS THE TRADE-OFF, AND IT IS THE READER'S CALL. Moving to triggered adds
+-- scheduling latency: data lands when the next trigger fires, not seconds after it
+-- arrives. score() states the measured update cadence so an admin can judge whether
+-- that is acceptable, rather than being told to flip a switch.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the data
+-- layer so this same SQL serves account-wide precompute and workspace-scoped live
+-- queries.
+WITH
+-- Current pipeline version: rank ALL versions, then keep the live one.
+-- Filtering delete_time before ranking would resurrect an older, still-"live"
+-- version of a since-deleted pipeline.
+{{ m.latest_scd_cte(
+     'latest_pipelines',
+     tbl('lakeflow','pipelines'),
+     'workspace_id, pipeline_id',
+     select_cols='workspace_id, pipeline_id, name AS pipeline_name, settings.continuous AS is_continuous, settings.development AS is_development, settings.serverless AS is_serverless, settings.photon AS is_photon, settings.edition AS edition, run_as, delete_time') }},
+-- Billed cost and, crucially, the number of distinct HOURS billed: for an
+-- always-on pipeline that count is the size of the window, which is what makes
+-- the idle share visible.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.dlt_pipeline_id AS pipeline_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus,
+    COUNT(DISTINCT date_trunc('HOUR', u.usage_start_time)) AS billed_hours,
+    -- Distinct billed days: spend is this rule's cost evidence, so billed days are
+    -- its observation window (finops_rules.history).
+    COUNT(DISTINCT u.usage_date) AS observed_days{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  -- sum ALL record_types. usage is an additive ledger; a RETRACTION's
+  -- negative quantity cancels a superseded ORIGINAL, so filtering to ORIGINAL kept
+  -- stale spend and dropped its correction.
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'DLT'
+    AND u.usage_metadata.dlt_pipeline_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Per-update aggregates (counts, cadence, failures). NOTE: active_hours is NOT
+-- computed here — counting distinct START hours would credit a single 100-hour
+-- update with just one active hour, so a genuinely round-the-clock continuous
+-- pipeline would read as almost entirely idle and be wrongly flagged. The active
+-- hours an update actually OCCUPIES are counted in `active_span` below, which
+-- explodes each update across every hour it spans (directly comparable to
+-- billed_hours).
+activity AS (
+  SELECT
+    t.workspace_id,
+    t.pipeline_id,
+    COUNT(DISTINCT t.update_id) AS updates_30d,
+    COUNT(DISTINCT CAST(t.period_start_time AS DATE)) AS active_days,
+    MAX(t.period_end_time) AS last_update_end,
+    -- Retries/restarts share a request_id, so a gap between these two counts is a
+    -- pipeline fighting to make progress rather than doing more work.
+    COUNT(DISTINCT t.request_id) AS requests_30d,
+    SUM(CASE WHEN t.result_state IN ('FAILED', 'TIMED_OUT', 'ERROR') THEN 1 ELSE 0 END)
+      AS failed_updates,
+    ROUND(AVG(
+      (unix_timestamp(t.period_end_time) - unix_timestamp(t.period_start_time)) / 60.0
+    ), 2) AS avg_update_minutes
+  FROM {{ tbl('lakeflow','pipeline_update_timeline') }} t
+  WHERE {{ m.window_lower('t.period_start_time') }}
+  GROUP BY 1, 2
+),
+-- Distinct HOURS an update was actually in flight over the lookback window. An
+-- update spanning several hours must count once for EVERY hour it covers (a
+-- 100-hour update occupies 100 hourly cells), which is why we explode its span
+-- instead of counting start hours. Directly comparable to billed_hours, so
+-- `idle_hours = billed - active` is a true measure and a continuous pipeline that
+-- runs back-to-back updates around the clock correctly shows ~0 idle.
+active_span AS (
+  SELECT workspace_id, pipeline_id, COUNT(DISTINCT h) AS active_hours
+  FROM (
+    SELECT t.workspace_id, t.pipeline_id,
+           explode(sequence(
+             date_trunc('HOUR', t.period_start_time),
+             date_trunc('HOUR', t.period_end_time),
+             INTERVAL 1 HOUR
+           )) AS h
+    FROM {{ tbl('lakeflow','pipeline_update_timeline') }} t
+    WHERE {{ m.window_lower('t.period_start_time') }}
+  )
+  GROUP BY 1, 2
+),
+-- 14-day hourly spine so hours the pipeline was NOT billed are represented at all
+-- (they have no usage row). Same construction as warehouse_autostop, and the same
+-- state encoding, so both rules feed the one `hour_heatmap` chart the frontend
+-- already knows: 0 = not billed, 1 = update in flight, 2 = billed but idle.
+hours AS (
+  SELECT explode(sequence(
+    date_trunc('HOUR', current_timestamp() - INTERVAL 14 DAYS),
+    date_trunc('HOUR', current_timestamp()) - INTERVAL 1 HOUR,
+    INTERVAL 1 HOUR
+  )) AS h
+),
+billed_hours AS (
+  SELECT workspace_id,
+         usage_metadata.dlt_pipeline_id AS pipeline_id,
+         date_trunc('HOUR', usage_start_time) AS h
+  FROM {{ tbl('billing','usage') }}
+  WHERE usage_metadata.dlt_pipeline_id IS NOT NULL
+    AND billing_origin_product = 'DLT'
+    -- all record_types (this is a billed-hour presence grid; a corrected
+    -- hour must still count as billed).
+    AND usage_start_time >= current_timestamp() - INTERVAL 14 DAYS
+  GROUP BY 1, 2, 3
+),
+-- An update spanning several hours must mark EVERY hour it covers, else a
+-- long-running update would read as idle. explode(sequence(...)) over its own
+-- start/end does that.
+active_hours AS (
+  SELECT t.workspace_id, t.pipeline_id, explode(sequence(
+           date_trunc('HOUR', t.period_start_time),
+           date_trunc('HOUR', t.period_end_time),
+           INTERVAL 1 HOUR
+         )) AS h
+  FROM {{ tbl('lakeflow','pipeline_update_timeline') }} t
+  WHERE t.period_start_time >= current_timestamp() - INTERVAL 14 DAYS
+),
+grid AS (
+  SELECT c.workspace_id, c.pipeline_id, hh.h,
+         CASE WHEN act.pipeline_id IS NOT NULL THEN 1
+              WHEN bh.pipeline_id IS NOT NULL THEN 2
+              ELSE 0 END AS state
+  FROM cost c
+  CROSS JOIN hours hh
+  LEFT JOIN billed_hours bh
+    ON bh.workspace_id = c.workspace_id AND bh.pipeline_id = c.pipeline_id AND bh.h = hh.h
+  LEFT JOIN (SELECT DISTINCT workspace_id, pipeline_id, h FROM active_hours) act
+    ON act.workspace_id = c.workspace_id AND act.pipeline_id = c.pipeline_id AND act.h = hh.h
+),
+series AS (
+  SELECT workspace_id, pipeline_id,
+         transform(
+           array_sort(collect_list(struct(h AS h, state AS state)),
+                      (l, r) -> CASE WHEN l.h < r.h THEN -1 WHEN l.h > r.h THEN 1 ELSE 0 END),
+           x -> x.state
+         ) AS hourly_states,
+         -- First hour of the series, so the heatmap can align rows to UTC days.
+         MIN(h) AS grid_start
+  FROM grid
+  GROUP BY 1, 2
+)
+SELECT
+  p.workspace_id,
+  p.pipeline_id,
+  p.pipeline_name,
+  p.is_continuous,
+  p.is_development,
+  p.is_serverless,
+  p.is_photon,
+  p.edition,
+  p.run_as,
+  ROUND(c.cost_30d_usd, 6) AS cost_30d_usd,
+  c.dbus_30d,
+  c.unpriced_dbus,{{ m.contract_cost_select('c') }}
+  c.billed_hours,
+  c.observed_days,
+  COALESCE(asp.active_hours, 0) AS active_hours,
+  -- The measured waste: billed hours in which no update was running. Floored at 0
+  -- because an update straddling an hour boundary can be counted in an hour that
+  -- carries no usage row, which would otherwise read as negative idle time.
+  GREATEST(c.billed_hours - COALESCE(asp.active_hours, 0), 0) AS idle_hours,
+  COALESCE(a.updates_30d, 0) AS updates_30d,
+  COALESCE(a.requests_30d, 0) AS requests_30d,
+  COALESCE(a.failed_updates, 0) AS failed_updates,
+  COALESCE(a.active_days, 0) AS active_days,
+  a.avg_update_minutes,
+  a.last_update_end,
+  s.hourly_states,
+  s.grid_start
+FROM latest_pipelines p
+JOIN cost c
+  ON p.workspace_id = c.workspace_id AND p.pipeline_id = c.pipeline_id
+LEFT JOIN activity a
+  ON p.workspace_id = a.workspace_id AND p.pipeline_id = a.pipeline_id
+LEFT JOIN active_span asp
+  ON p.workspace_id = asp.workspace_id AND p.pipeline_id = asp.pipeline_id
+LEFT JOIN series s
+  ON p.workspace_id = s.workspace_id AND p.pipeline_id = s.pipeline_id
+-- Continuous only. `continuous` is NULL on some rows (older pipeline definitions),
+-- and NULL is not "true" — treating it as such would flag triggered pipelines,
+-- whose compute already stops between updates, and recommend a change worth $0.
+WHERE COALESCE(p.is_continuous, FALSE) = TRUE
+  -- Development pipelines are expected to hold compute warm while someone iterates.
+  AND COALESCE(p.is_development, FALSE) = FALSE
+  AND c.cost_30d_usd > 0

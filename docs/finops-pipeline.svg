@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 730" font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#5A6A72"/>
+    </marker>
+    <style>
+      .box   { rx: 10; }
+      .edge  { stroke: #5A6A72; stroke-width: 2; fill: none; }
+      .t-title { font-size: 15px; font-weight: 700; }
+      .t-sub   { font-size: 11px; }
+      .t-tag   { font-size: 11px; font-weight: 700; letter-spacing: 1px; }
+      .t-body  { font-size: 11.5px; }
+      .t-note  { font-size: 11px; font-style: italic; fill: #7A8A92; }
+      .navy  { fill: #1B3139; }
+      .white { fill: #FFFFFF; }
+      .dark  { fill: #1B3139; }
+      .muted { fill: #AEBCC2; }
+      .grey  { fill: #5A6A72; }
+    </style>
+  </defs>
+
+  <!-- ===== Source: Unity Catalog system tables ===== -->
+  <rect class="box" x="170" y="24" width="620" height="66" fill="#1B3139"/>
+  <text class="t-title white" x="480" y="52" text-anchor="middle">Unity Catalog system tables</text>
+  <text class="t-sub muted" x="480" y="74" text-anchor="middle">billing.usage · list_prices · compute.clusters / node_timeline · lakeflow.jobs / pipelines · access.table_lineage</text>
+
+  <path class="edge" d="M480,90 L480,120" marker-end="url(#arrow)"/>
+
+  <!-- ===== Rule SQL ===== -->
+  <rect class="box" x="290" y="122" width="380" height="50" fill="#FFFFFF" stroke="#C6CDD1" stroke-width="1.5"/>
+  <rect x="290" y="122" width="5" height="50" rx="2" fill="#5A6A72"/>
+  <text class="t-title dark" x="486" y="145" text-anchor="middle">Rule SQL</text>
+  <text class="t-sub grey" x="486" y="162" text-anchor="middle">finds candidate resources + raw metrics</text>
+
+  <path class="edge" d="M480,172 L480,200" marker-end="url(#arrow)"/>
+
+  <!-- ===== Python score() ===== -->
+  <rect class="box" x="290" y="202" width="380" height="50" fill="#FFFFFF" stroke="#C6CDD1" stroke-width="1.5"/>
+  <rect x="290" y="202" width="5" height="50" rx="2" fill="#5A6A72"/>
+  <text class="t-title dark" x="486" y="225" text-anchor="middle">Python score()</text>
+  <text class="t-sub grey" x="486" y="242" text-anchor="middle">decides &amp; prices · pricing macro · observation + coverage guards</text>
+
+  <path class="edge" d="M480,252 L480,280" marker-end="url(#arrow)"/>
+
+  <!-- ===== RuleFinding ===== -->
+  <rect class="box" x="290" y="282" width="380" height="50" fill="#FFFFFF" stroke="#C6CDD1" stroke-width="1.5"/>
+  <rect x="290" y="282" width="5" height="50" rx="2" fill="#5A6A72"/>
+  <text class="t-title dark" x="486" y="305" text-anchor="middle">RuleFinding</text>
+  <text class="t-sub grey" x="486" y="322" text-anchor="middle">why · how · $ / month · effort</text>
+
+  <path class="edge" d="M480,332 L480,360" marker-end="url(#arrow)"/>
+
+  <!-- ===== NBA ranker ===== -->
+  <rect class="box" x="290" y="362" width="380" height="50" fill="#FFF0EC" stroke="#FF3621" stroke-width="1.5"/>
+  <rect x="290" y="362" width="5" height="50" rx="2" fill="#FF3621"/>
+  <text class="t-title dark" x="486" y="385" text-anchor="middle">Next Best Action ranker</text>
+  <text class="t-sub grey" x="486" y="402" text-anchor="middle">savings ÷ effort</text>
+
+  <!-- ===== Fork to the two execution modes ===== -->
+  <path class="edge" d="M480,412 L480,432"/>
+  <path class="edge" d="M270,432 L690,432"/>
+  <path class="edge" d="M270,432 L270,454" marker-end="url(#arrow)"/>
+  <path class="edge" d="M690,432 L690,454" marker-end="url(#arrow)"/>
+  <text class="t-note" x="480" y="449" text-anchor="middle">one rule, authored once — runs identically in both modes</text>
+
+  <!-- Live mode -->
+  <rect class="box" x="70" y="456" width="400" height="86" fill="#EAF1F6" stroke="#8FB4CC" stroke-width="1.5"/>
+  <text class="t-tag" x="270" y="480" text-anchor="middle" fill="#2A6F97">LIVE MODE</text>
+  <text class="t-body dark" x="270" y="502" text-anchor="middle">Run rule SQL on a SQL warehouse, on demand</text>
+  <text class="t-sub grey" x="270" y="522" text-anchor="middle">development · a few workspaces</text>
+
+  <!-- Precompute mode -->
+  <rect class="box" x="490" y="456" width="400" height="86" fill="#EAF3EC" stroke="#86BE96" stroke-width="1.5"/>
+  <text class="t-tag" x="690" y="480" text-anchor="middle" fill="#2E7D46">PRECOMPUTE MODE</text>
+  <text class="t-body dark" x="690" y="502" text-anchor="middle">Scheduled job runs rules account-wide,</text>
+  <text class="t-body dark" x="690" y="518" text-anchor="middle">writes a Delta table the app just SELECTs</text>
+  <text class="t-sub grey" x="690" y="536" text-anchor="middle">production · 100s of workspaces</text>
+
+  <!-- ===== Merge to backend ===== -->
+  <path class="edge" d="M270,542 L270,566"/>
+  <path class="edge" d="M690,542 L690,566"/>
+  <path class="edge" d="M270,566 L690,566"/>
+  <path class="edge" d="M480,566 L480,588" marker-end="url(#arrow)"/>
+
+  <!-- FastAPI -->
+  <rect class="box" x="360" y="590" width="240" height="46" fill="#FFFFFF" stroke="#C6CDD1" stroke-width="1.5"/>
+  <text class="t-title dark" x="480" y="612" text-anchor="middle">FastAPI backend</text>
+  <text class="t-sub grey" x="480" y="628" text-anchor="middle">/api · persona scoping</text>
+
+  <path class="edge" d="M480,636 L480,662" marker-end="url(#arrow)"/>
+
+  <!-- Output: SPA + Genie -->
+  <rect class="box" x="250" y="664" width="460" height="52" fill="#1B3139"/>
+  <text class="t-title white" x="480" y="686" text-anchor="middle">React SPA (persona-aware)</text>
+  <text class="t-sub muted" x="480" y="704" text-anchor="middle">savings leaderboard · resource drill-down  +  Genie Agent (ask / alert)</text>
+</svg>

@@ -1,0 +1,132 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: untagged_spend
+-- Resources whose billed spend carries none of the required ownership tags, so
+-- the money cannot be charged back to a team, project or cost centre.
+--
+-- WHY THIS IS A COST RULE, NOT A LINT RULE
+--   This is the only rule in the catalog whose finding is not "you are paying for
+--   something you don't need". It is "you cannot tell WHOSE this spend is" — the
+--   showback/chargeback pillar of FinOps. Nobody can act on the other 15 rules'
+--   findings at scale without it: "this cluster wastes $800/mo" needs an owner to
+--   send it to. So its savings are reported as $0 (see score()) and its value is
+--   the dollars it makes ATTRIBUTABLE, carried as monthly_waste_usd.
+--
+-- TAG MATCHING IS CASE- AND SPELLING-INSENSITIVE.
+--   Verified live: this account carries BOTH `Owner` and `owner` as distinct keys,
+--   plus `Project`/`project`. An exact-match check would report a tagged resource
+--   as untagged purely because someone typed a capital letter, which is the fastest
+--   way to make a governance report ignorable. Keys are lowercased and matched
+--   against the alias list in config/thresholds.yaml, and an empty/whitespace value
+--   counts as absent (a tag present but blank attributes nothing).
+--
+-- GRAIN: one row per (workspace, resource). A resource is a cluster, warehouse or
+--   job — the three things an admin can actually put a tag on, and the three
+--   resource_types the frontend already deep-links. Usage that carries no resource
+--   id at all (serverless product spend such as APPS or VECTOR_SEARCH) is excluded
+--   deliberately: there is no resource to open and tag, so a finding would be
+--   unactionable. That spend is reported on the Apps/Genie tabs instead.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the data
+-- layer so this same SQL serves account-wide precompute and workspace-scoped live
+-- queries.
+WITH usage_rows AS (
+  SELECT
+    u.workspace_id,
+    -- The taggable resource this usage belongs to. Order matters only in that a
+    -- usage row carries exactly one of these.
+    COALESCE(
+      u.usage_metadata.cluster_id,
+      u.usage_metadata.warehouse_id,
+      CAST(u.usage_metadata.job_id AS STRING)
+    ) AS resource_id,
+    CASE
+      WHEN u.usage_metadata.cluster_id IS NOT NULL THEN 'cluster'
+      WHEN u.usage_metadata.warehouse_id IS NOT NULL THEN 'warehouse'
+      ELSE 'job'
+    END AS resource_type,
+    u.usage_metadata.job_name AS job_name,
+    u.custom_tags,
+    u.usage_date,
+    u.usage_quantity,
+    {{ m.price_rate('lp') }} AS rate,
+    {{ m.unpriced_dbus() }} AS unpriced_qty,
+    -- Fallback ownership signal. NOT a substitute for a tag: it says who ran the
+    -- workload, not which cost centre pays for it. Reported so the "how" can name
+    -- a person to ask rather than leaving the admin with an anonymous resource.
+    COALESCE(u.identity_metadata.owned_by, u.identity_metadata.run_as,
+             u.identity_metadata.created_by) AS identity_hint
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    -- keep ALL record_types. usage is additive; a RETRACTION carries a
+    -- negative quantity that cancels the superseded ORIGINAL, so summing every
+    -- record_type yields the CORRECTED spend. Filtering to ORIGINAL kept stale
+    -- rows and dropped the correction — the opposite of avoiding double-counting.
+    AND COALESCE(
+          u.usage_metadata.cluster_id,
+          u.usage_metadata.warehouse_id,
+          CAST(u.usage_metadata.job_id AS STRING)
+        ) IS NOT NULL
+),
+-- Per usage row: which required tags are present. map_filter (not a correlated
+-- subquery, which Spark rejects on a map column) lowercases the key and rejects
+-- blank values.
+tagged AS (
+  SELECT
+    *,
+{%- for tag, aliases in required_tags.items() %}
+    size(map_filter(custom_tags, (k, v) ->
+      lower(k) IN ({% for a in aliases %}'{{ a | lower }}'{{ ", " if not loop.last }}{% endfor %})
+      AND v IS NOT NULL AND trim(v) <> ''
+    )) > 0 AS has_{{ tag }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+  FROM usage_rows
+),
+per_resource AS (
+  SELECT
+    workspace_id,
+    resource_id,
+    resource_type,
+    MAX(job_name) AS job_name,
+    ROUND(SUM(usage_quantity * rate), 6) AS cost_30d_usd,
+    SUM(usage_quantity) AS dbus_30d,
+    SUM(unpriced_qty) AS unpriced_dbus,
+    -- Distinct billed days. Spend is this rule's only evidence, so billed days ARE
+    -- the observation window (finops_rules.history).
+    COUNT(DISTINCT usage_date) AS observed_days,
+    MAX(identity_hint) AS identity_hint,
+    -- A tag counts as present for the resource if ANY of its usage rows carry it.
+    -- Deliberately generous: a cluster retagged mid-window is tagged now, and
+    -- nagging about the untagged first half would be advice about the past.
+{%- for tag in required_tags %}
+    MAX(CASE WHEN has_{{ tag }} THEN 1 ELSE 0 END) = 1 AS has_{{ tag }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+  FROM tagged
+  GROUP BY workspace_id, resource_id, resource_type
+)
+SELECT
+  workspace_id,
+  resource_id,
+  resource_type,
+  job_name,
+  cost_30d_usd,
+  dbus_30d,
+  unpriced_dbus,
+  observed_days,
+  identity_hint,
+  -- The missing tag NAMES, not per-tag booleans. score() needs the names anyway
+  -- (to tell the admin what to add), and deriving them here keeps Python off the
+  -- boolean columns entirely: the readers disagree about booleans — Spark and the
+  -- SQL connector return real bools, while the REST statement API returns the
+  -- STRINGS 'true'/'false', and `bool('false')` is True. A string-typed false
+  -- would silently report every tag as present, i.e. report the governance gap as
+  -- closed. An array of strings survives all three readers (and the pipeline's
+  -- to_json bridge) unambiguously.
+  array_compact(array(
+{%- for tag in required_tags %}
+    CASE WHEN has_{{ tag }} THEN NULL ELSE '{{ tag }}' END{{ "," if not loop.last else "" }}
+{%- endfor %}
+  )) AS missing_tags,
+  {{ required_tags | length }} AS required_tag_count
+FROM per_resource
+WHERE cost_30d_usd > 0

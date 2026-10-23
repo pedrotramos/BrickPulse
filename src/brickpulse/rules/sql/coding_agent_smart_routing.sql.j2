@@ -1,0 +1,211 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: coding_agent_smart_routing  (Unity AI Gateway Smart Routing for coding agents)
+--
+-- FORMULA HEADER
+--   cost basis:      system.billing.usage × list_prices, attributed to the gateway
+--                    endpoint + destination model through usage_metadata.ai_gateway
+--                    (a nested struct information_schema truncates, so it is easy to
+--                    miss). Within one (workspace, endpoint, model) pool the billed
+--                    dollars are split across requests by a token weight
+--                    (uncached input + 0.1 × cache reads + 5 × output). The weight
+--                    only divides a pool that billing already priced exactly, so
+--                    per-model totals are exact and only the split between sessions
+--                    of the same model is approximate.
+--   units:           $ per session and per turn (one turn = one gateway request).
+--   counterfactual:  Smart Routing picks the cheapest capable system.ai model once
+--                    per coding-agent session (Claude Code / Codex / Omnigent). The
+--                    workspace's OWN routed sessions show what that does to cost per
+--                    turn. That rate, applied to the unrouted sessions, is the estimate.
+--   savings_status:  advisory (Labs). The estimate is shown, never booked.
+--
+-- DETECTION (measured, per workspace, from system.ai_gateway.usage):
+--   * Coding-agent traffic = the harness's user agent (claude-cli, codex-tui, …) on
+--     the Anthropic Messages / OpenAI Responses APIs, against system.ai.* model
+--     services (the only ones the router can choose from).
+--   * The router's own classifier calls carry invocation_metadata.source = 'ROUTER'.
+--     They are excluded from the traffic and used as the "this session was routed"
+--     marker: a session is ROUTED when its requester made a ROUTER call between
+--     5 minutes before the session's first request and its last one.
+--   * Session = one requester + one harness, split at a {{ session_gap_minutes }}-minute gap
+--     (no session id is logged).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH gw AS (  -- every successful gateway request in the window, with its token weight
+  SELECT
+    workspace_id,
+    endpoint_id,
+    endpoint_name,
+    destination_model AS model,
+    requester,
+    event_time,
+    invocation_metadata.source AS source,
+    api_type,
+    lower(regexp_extract(user_agent, '^([A-Za-z_\\-\\.]+)', 1)) AS harness,
+    COALESCE(input_tokens, 0) AS in_tok,
+    COALESCE(output_tokens, 0) AS out_tok,
+    COALESCE(input_tokens, 0) - COALESCE(token_details.cache_read_input_tokens, 0)
+      + 0.1 * COALESCE(token_details.cache_read_input_tokens, 0)
+      + 5 * COALESCE(output_tokens, 0) AS w
+  FROM {{ tbl('ai_gateway','usage') }}
+  WHERE {{ m.window_lower('event_time') }}
+    AND status_code < 400
+    AND requester IS NOT NULL
+),
+billed AS (  -- list-price dollars per (workspace, gateway endpoint, model)
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.ai_gateway.endpoint_id AS endpoint_id,
+    u.usage_metadata.ai_gateway.destination_model AS model,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.ai_gateway.endpoint_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+pool_rate AS (  -- $ per unit of token weight, per billed pool
+  SELECT g.workspace_id, g.endpoint_id, g.model,
+         b.usd / NULLIF(SUM(g.w), 0) AS usd_per_w, MAX(b.unpriced_dbus) AS unpriced_dbus
+  FROM gw g
+  JOIN billed b USING (workspace_id, endpoint_id, model)
+  GROUP BY g.workspace_id, g.endpoint_id, g.model, b.usd
+),
+router AS (
+  SELECT workspace_id, requester, event_time AS rt FROM gw WHERE source = 'ROUTER'
+),
+agent AS (  -- coding-agent requests on system.ai.* services, priced
+  SELECT g.*, g.w * COALESCE(p.usd_per_w, 0) AS usd,
+         p.usd_per_w IS NULL AS unpriced,
+         g.model RLIKE '{{ premium_model_pattern }}' AS premium
+  FROM gw g
+  LEFT JOIN pool_rate p USING (workspace_id, endpoint_id, model)
+  WHERE COALESCE(g.source, '') <> 'ROUTER'
+    AND g.api_type IN ('anthropic/v1/messages', 'openai/v1/responses')
+    AND g.harness IN ({% for h in coding_agent_harnesses %}'{{ h }}'{{ ", " if not loop.last }}{% endfor %})
+),
+routable AS (SELECT * FROM agent WHERE endpoint_name LIKE 'system.ai.%'),
+marked AS (
+  SELECT *,
+    CASE WHEN LAG(event_time) OVER win IS NULL
+           OR event_time > LAG(event_time) OVER win + INTERVAL {{ session_gap_minutes }} MINUTES
+         THEN 1 ELSE 0 END AS new_session
+  FROM routable
+  WINDOW win AS (PARTITION BY workspace_id, requester, harness ORDER BY event_time)
+),
+sessioned AS (
+  SELECT *, SUM(new_session) OVER (
+    PARTITION BY workspace_id, requester, harness ORDER BY event_time
+  ) AS session_no
+  FROM marked
+),
+sessions AS (
+  SELECT workspace_id, requester, harness, session_no,
+         MIN(event_time) AS s0, MAX(event_time) AS s1,
+         COUNT(*) AS turns, SUM(usd) AS usd,
+         SUM(CASE WHEN premium THEN usd ELSE 0 END) AS premium_usd
+  FROM sessioned
+  GROUP BY 1, 2, 3, 4
+),
+flagged AS (
+  SELECT s.*, MAX(r.rt IS NOT NULL) AS routed
+  FROM sessions s
+  LEFT JOIN router r
+    ON r.workspace_id = s.workspace_id AND r.requester = s.requester
+   AND r.rt BETWEEN s.s0 - INTERVAL 5 MINUTES AND s.s1
+  GROUP BY ALL
+),
+-- Every request tagged with its session's routed flag: the daily and per-model views.
+req AS (
+  SELECT q.*, f.routed
+  FROM sessioned q
+  JOIN flagged f USING (workspace_id, requester, harness, session_no)
+),
+per_ws AS (
+  SELECT
+    workspace_id,
+    COUNT(*) AS sessions,
+    SUM(CAST(routed AS INT)) AS routed_sessions,
+    COUNT(DISTINCT requester) AS agent_users,
+    COUNT(DISTINCT CASE WHEN routed THEN requester END) AS routed_users,
+    SUM(turns) AS turns,
+    SUM(usd) AS agent_cost_usd,
+    SUM(CASE WHEN NOT routed THEN usd ELSE 0 END) AS unrouted_cost_usd,
+    SUM(CASE WHEN NOT routed THEN premium_usd ELSE 0 END) AS unrouted_premium_cost_usd,
+    SUM(CASE WHEN routed THEN usd ELSE 0 END) AS routed_cost_usd,
+    -- Cost per turn by session size, routed vs not: the measured routing effect.
+    SUM(CASE WHEN NOT routed AND turns <= {{ short_session_max_turns }} THEN usd ELSE 0 END) AS short_unrouted_usd,
+    SUM(CASE WHEN NOT routed AND turns <= {{ short_session_max_turns }} THEN turns ELSE 0 END) AS short_unrouted_turns,
+    SUM(CASE WHEN routed AND turns <= {{ short_session_max_turns }} THEN usd ELSE 0 END) AS short_routed_usd,
+    SUM(CASE WHEN routed AND turns <= {{ short_session_max_turns }} THEN turns ELSE 0 END) AS short_routed_turns,
+    SUM(CASE WHEN routed AND turns <= {{ short_session_max_turns }} THEN 1 ELSE 0 END) AS short_routed_sessions,
+    SUM(CASE WHEN NOT routed AND turns > {{ short_session_max_turns }} THEN usd ELSE 0 END) AS long_unrouted_usd,
+    SUM(CASE WHEN NOT routed AND turns > {{ short_session_max_turns }} THEN turns ELSE 0 END) AS long_unrouted_turns,
+    SUM(CASE WHEN routed AND turns > {{ short_session_max_turns }} THEN usd ELSE 0 END) AS long_routed_usd,
+    SUM(CASE WHEN routed AND turns > {{ short_session_max_turns }} THEN turns ELSE 0 END) AS long_routed_turns,
+    SUM(CASE WHEN routed AND turns > {{ short_session_max_turns }} THEN 1 ELSE 0 END) AS long_routed_sessions
+  FROM flagged
+  GROUP BY 1
+),
+per_ws_req AS (
+  SELECT workspace_id,
+         COUNT(DISTINCT CAST(event_time AS DATE)) AS observed_days,
+         SUM(CAST(unpriced AS INT)) AS unpriced_requests,
+         COUNT(*) AS requests
+  FROM routable GROUP BY 1
+),
+-- Coding-agent spend on custom (non system.ai) gateway endpoints: the router cannot
+-- choose those, so it is reported, never counted.
+not_routable AS (
+  SELECT workspace_id, SUM(usd) AS custom_endpoint_cost_usd
+  FROM agent WHERE endpoint_name NOT LIKE 'system.ai.%' GROUP BY 1
+),
+daily AS (
+  SELECT workspace_id, CAST(event_time AS DATE) AS d,
+         SUM(CASE WHEN NOT routed AND premium THEN usd ELSE 0 END) AS up,
+         SUM(CASE WHEN NOT routed AND NOT premium THEN usd ELSE 0 END) AS uo,
+         SUM(CASE WHEN routed THEN usd ELSE 0 END) AS r
+  FROM req GROUP BY 1, 2
+),
+daily_arr AS (
+  SELECT workspace_id,
+         transform(array_sort(collect_list(struct(d, up, uo, r))),
+                   x -> named_struct('d', CAST(x.d AS STRING), 'up', ROUND(x.up, 2),
+                                     'uo', ROUND(x.uo, 2), 'r', ROUND(x.r, 2))) AS days
+  FROM daily GROUP BY 1
+),
+models AS (  -- unrouted spend per model, with the token shape behind it
+  SELECT workspace_id, model,
+         SUM(usd) AS usd, COUNT(DISTINCT requester) AS users,
+         ROUND(AVG(in_tok)) AS avg_in, ROUND(AVG(out_tok)) AS avg_out,
+         ROUND(STDDEV(in_tok) / NULLIF(AVG(in_tok), 0), 2) AS cv_in
+  FROM req WHERE NOT routed GROUP BY 1, 2
+),
+models_arr AS (
+  SELECT workspace_id,
+         slice(transform(array_sort(collect_list(struct(-usd AS k, model, usd, users, avg_in, avg_out, cv_in))),
+                         x -> named_struct('model', x.model, 'usd', ROUND(x.usd, 2), 'users', x.users,
+                                           'avg_in', x.avg_in, 'avg_out', x.avg_out, 'cv_in', x.cv_in)),
+               1, 6) AS top_models
+  FROM models GROUP BY 1
+)
+SELECT
+  w.workspace_id,
+  r.observed_days,
+  r.requests,
+  r.unpriced_requests,
+  w.sessions, w.routed_sessions, w.agent_users, w.routed_users, w.turns,
+  w.agent_cost_usd, w.unrouted_cost_usd, w.unrouted_premium_cost_usd, w.routed_cost_usd,
+  w.short_unrouted_usd, w.short_unrouted_turns, w.short_routed_usd, w.short_routed_turns,
+  w.short_routed_sessions,
+  w.long_unrouted_usd, w.long_unrouted_turns, w.long_routed_usd, w.long_routed_turns,
+  w.long_routed_sessions,
+  COALESCE(n.custom_endpoint_cost_usd, 0) AS custom_endpoint_cost_usd,
+  d.days,
+  mo.top_models
+FROM per_ws w
+JOIN per_ws_req r USING (workspace_id)
+LEFT JOIN not_routable n USING (workspace_id)
+LEFT JOIN daily_arr d USING (workspace_id)
+LEFT JOIN models_arr mo USING (workspace_id)
+WHERE w.unrouted_premium_cost_usd > 0

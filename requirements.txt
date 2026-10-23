@@ -1,0 +1,12 @@
+# Direct runtime dependencies pinned to versions verified locally.
+# The platform resolves compatible transitive wheels for its Python/Linux runtime.
+fastapi==0.140.13
+uvicorn==0.52.4
+pydantic==2.13.4
+pydantic-settings==2.14.2
+databricks-sql-connector==4.4.0
+databricks-sdk==0.139.0
+requests==2.34.2
+jinja2==3.1.6
+pyyaml==6.0.3
+python-dotenv==1.2.2

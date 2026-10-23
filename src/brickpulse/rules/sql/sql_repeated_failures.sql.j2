@@ -1,0 +1,151 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: sql_repeated_failures  (SQL workload efficiency)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the warehouse's usage)
+--   units:           Spark task-milliseconds (slot occupancy); dollars via the
+--                    warehouse's corrected DBU cost apportioned by task-ms share.
+--   counterfactual:  the compute consumed by REPEATEDLY-FAILING queries is work
+--                    that produced nothing. Fixing or removing the failing query
+--                    eliminates that slot time. Whether the warehouse bill actually
+--                    drops depends on whether it would otherwise be idle, so this is
+--                    an ADDRESSABLE figure, not booked savings.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      addressable <= corrected warehouse cost (bounded by construction:
+--                    a share in [0,1] of the same cost); closed-open window; corrections
+--                    applied via the canonical cost layer; coverage-guarded.
+--
+-- DETECTION (measured, per warehouse, from system.query.history):
+--   * A query is FAILED when execution_status = 'FAILED' (CANCELED is a deliberate
+--     stop, not broken work, and is not counted). We keep queries that a warehouse
+--     ran (compute.warehouse_id present) — query.history covers DBSQL warehouses.
+--   * "Repeated" means the same failing query SHAPE (first 200 chars of statement
+--     text) recurs: a one-off typo is noise, a query that fails the same way many
+--     times a day is a broken scheduled job burning compute. We surface the top
+--     repeating shape and the count of distinct failing shapes.
+--   * Compute is apportioned by total_task_duration_ms (summed Spark task time =
+--     slot occupancy), so a query that failed after scanning half the table costs
+--     more than one that failed at parse time. execution_duration_ms is the
+--     fallback share when task duration is unpopulated.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH hist AS (  -- one row per warehouse query in the window, with its day + failed flag
+  SELECT
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    CAST(start_time AS DATE) AS day,
+    CASE WHEN execution_status = 'FAILED' THEN 1 ELSE 0 END AS failed,
+    COALESCE(total_task_duration_ms, 0) AS task_ms,
+    COALESCE(execution_duration_ms, 0) AS exec_ms,
+    statement_text
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND execution_status IS NOT NULL
+    AND {{ m.window_lower('start_time') }}
+),
+per_wh AS (
+  SELECT
+    workspace_id,
+    warehouse_id,
+    COUNT(*) AS queries,
+    -- Distinct days a query ran: one bad afternoon (a single incident) is not the
+    -- recurring pattern this rule targets, so score() suppresses rows below
+    -- min_observation_days (finops_rules.history).
+    COUNT(DISTINCT day) AS observed_days,
+    SUM(failed) AS failed_queries,
+    SUM(task_ms) AS total_task_ms,
+    SUM(CASE WHEN failed = 1 THEN task_ms ELSE 0 END) AS failed_task_ms,
+    SUM(exec_ms) AS total_exec_ms,
+    SUM(CASE WHEN failed = 1 THEN exec_ms ELSE 0 END) AS failed_exec_ms,
+    -- How many DISTINCT failing shapes — separates "one query failing 500 times"
+    -- (a single broken job, easy to fix) from "500 different queries each failing
+    -- once" (ad-hoc noise, not a finding).
+    COUNT(DISTINCT CASE WHEN failed = 1 THEN substr(statement_text, 1, 200) END)
+      AS distinct_failed_shapes
+  FROM hist
+  GROUP BY 1, 2
+  HAVING SUM(failed) >= {{ min_failed_queries }}
+),
+-- The single most-repeated failing shape per warehouse, for the "why".
+fail_shapes AS (
+  SELECT
+    workspace_id, warehouse_id,
+    substr(statement_text, 1, 200) AS shape,
+    COUNT(*) AS n
+  FROM hist
+  WHERE failed = 1
+  GROUP BY 1, 2, 3
+),
+top_fail AS (
+  SELECT workspace_id, warehouse_id, shape AS top_failed_statement, n AS top_failed_count
+  FROM fail_shapes
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY n DESC
+  ) = 1
+),
+-- Per-day failed vs total, for the chart.
+daily AS (
+  SELECT workspace_id, warehouse_id, day,
+         COUNT(*) AS total, SUM(failed) AS failed
+  FROM hist
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, warehouse_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, total AS t, failed AS f)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 't', x.t, 'f', x.f)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+),
+-- Corrected warehouse cost: all record_types summed, effective_list
+-- rate, closed-open window, unpriced usage tracked for the coverage guard.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+),
+latest_warehouses AS (
+  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size
+  FROM {{ tbl('compute','warehouses') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+  ) = 1
+)
+SELECT
+  p.workspace_id,
+  p.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  p.queries,
+  p.observed_days,
+  p.failed_queries,
+  ROUND(p.failed_queries / p.queries, 4) AS fail_rate,
+  p.distinct_failed_shapes,
+  p.total_task_ms,
+  p.failed_task_ms,
+  p.total_exec_ms,
+  p.failed_exec_ms,
+  tf.top_failed_statement,
+  tf.top_failed_count,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus,
+  da.days
+FROM per_wh p
+LEFT JOIN top_fail tf USING (workspace_id, warehouse_id)
+LEFT JOIN daily_arr da USING (workspace_id, warehouse_id)
+LEFT JOIN cost c USING (workspace_id, warehouse_id)
+LEFT JOIN latest_warehouses w USING (workspace_id, warehouse_id)

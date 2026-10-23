@@ -1,0 +1,145 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: warehouse_rightsize  (Gap G3 — warehouse SIZE over-provisioning)
+-- rightsize_underutilized covers CLUSTERS (it reads per-minute CPU). Warehouses
+-- expose no CPU, so warehouse SIZE waste had no rule. This fills that gap.
+--
+-- METHODOLOGY (inferred from measured query load; low-confidence by design):
+--   A warehouse's t-shirt SIZE sets its DBU/hour rate — each step down the ladder
+--   (e.g. SMALL -> X_SMALL) halves the nodes and the rate. Size is the right
+--   lever to shrink when a warehouse shows clear HORSEPOWER headroom:
+--     * no spill to disk (spilled_pct ~ 0)          -> memory is not the bottleneck
+--     * small scanned data volumes (p95 read bytes) -> not data-bound
+--     * queries are not queueing for capacity        -> not concurrency-bound
+--       (queueing is a CLUSTER-COUNT problem, not a size one, so a warehouse
+--        under queue pressure is EXCLUDED — downsizing would make it worse).
+--   When all hold, the same work fits a smaller size for proportionally less
+--   money (a little slower, acceptable when nothing is latency-critical).
+--
+--   We do NOT read CPU (warehouses don't expose it) — the size is inferred from
+--   query behaviour, so score() flags this LOW confidence and proposes a single,
+--   conservative step down (the ladder guarantees that halves the rate). Deeper
+--   downsizing is left to the operator after they confirm the first step is fine.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH latest_warehouses AS (
+  SELECT workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size
+  FROM {{ tbl('compute','warehouses') }}
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY workspace_id, warehouse_id ORDER BY change_time DESC
+  ) = 1
+),
+-- Per-warehouse query-load profile over the lookback.
+load AS (
+  SELECT
+    -- warehouse_id is unique only within a workspace; carry workspace_id
+    -- into the grain so the final join cannot merge two workspaces' loads.
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    COUNT(*) AS queries,
+    -- Distinct days with queries. min_queries alone can be satisfied by one busy
+    -- afternoon, whose peak load says nothing about the week's — and downsizing a
+    -- warehouse on that is how you cause a regression. score() suppresses rows
+    -- below min_observation_days (finops_rules.history).
+    COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days,
+    SUM(CASE WHEN waiting_at_capacity_duration_ms > 0 THEN 1 ELSE 0 END) / COUNT(*) AS queued_pct,
+    SUM(CASE WHEN spilled_local_bytes > 0 THEN 1 ELSE 0 END) / COUNT(*) AS spilled_pct,
+    PERCENTILE(read_bytes, 0.95) / 1e9 AS p95_read_gb,
+    PERCENTILE(execution_duration_ms, 0.95) / 1000.0 AS p95_runtime_s
+  FROM {{ tbl('query','history') }}
+  WHERE compute.warehouse_id IS NOT NULL
+    AND {{ m.window_lower('start_time') }}
+  GROUP BY 1, 2
+),
+-- Peak concurrency: the most query starts observed in any single minute.
+concurrency AS (
+  SELECT workspace_id, warehouse_id, MAX(c) AS peak_concurrency
+  FROM (
+    SELECT workspace_id,
+           compute.warehouse_id AS warehouse_id,
+           date_trunc('MINUTE', start_time) AS m,
+           COUNT(*) AS c
+    FROM {{ tbl('query','history') }}
+    WHERE compute.warehouse_id IS NOT NULL
+      AND {{ m.window_lower('start_time') }}
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+-- Measured SPARK SLOT occupancy — a DIRECT horsepower signal, unlike the
+-- queue/spill/scan proxies above. total_task_duration_ms is the summed wall time
+-- of every Spark task a query ran across all slots; dividing a minute's worth of
+-- that by 60 gives the number of slots kept busy in that minute (bounded by the
+-- warehouse's real slot count). We credit each query's slot-seconds to its START
+-- minute — exact for the sub-minute queries that dominate a warehouse, and a small
+-- over-attribution for rare long queries (which only makes the utilisation estimate
+-- HIGHER, i.e. more conservative about downsizing). The PEAK per-minute value is
+-- what the size must cover, so it (not the mean) decides whether a step is safe.
+-- NULL-safe: warehouses whose queries never populate task duration fall through to
+-- the proxy-only path (peak_slots_used is NULL), so this never blocks the rule.
+slot_util AS (
+  SELECT workspace_id, warehouse_id,
+         PERCENTILE(slots_busy, 0.99) AS p99_slots_used,
+         MAX(slots_busy)              AS peak_slots_used,
+         SUM(task_seconds)            AS total_task_seconds
+  FROM (
+    SELECT workspace_id,
+           compute.warehouse_id AS warehouse_id,
+           date_trunc('MINUTE', start_time) AS m,
+           SUM(total_task_duration_ms) / 1000.0 / 60.0 AS slots_busy,
+           SUM(total_task_duration_ms) / 1000.0        AS task_seconds
+    FROM {{ tbl('query','history') }}
+    WHERE compute.warehouse_id IS NOT NULL
+      AND {{ m.window_lower('start_time') }}
+      AND total_task_duration_ms > 0
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    -- Usage that found no list price, so an incomplete cost is visible
+    -- rather than silently reported as a smaller number (finops_rules.coverage).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2
+){{ m.cloud_cost_cte('cloud_cost', 'warehouse_id') }}
+SELECT
+  w.workspace_id,
+  w.warehouse_id,
+  w.warehouse_name,
+  w.warehouse_type,
+  w.warehouse_size,
+  l.queries,
+  l.observed_days,
+  ROUND(l.queued_pct, 4) AS queued_pct,
+  ROUND(l.spilled_pct, 4) AS spilled_pct,
+  ROUND(l.p95_read_gb, 3) AS p95_read_gb,
+  ROUND(l.p95_runtime_s, 2) AS p95_runtime_s,
+  COALESCE(c.peak_concurrency, 0) AS peak_concurrency,
+  -- Measured slot signal (NULL when no task data — proxy-only path then).
+  ROUND(su.peak_slots_used, 2) AS peak_slots_used,
+  ROUND(su.p99_slots_used, 2) AS p99_slots_used,
+  COALESCE(cost.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(cost.dbus_30d, 0) AS dbus_30d,
+  COALESCE(cost.unpriced_dbus, 0) AS unpriced_dbus{{ m.contract_cost_select('cost', lead=True) }}{{ m.cloud_cost_select(lead=True) }}
+FROM latest_warehouses w
+-- every join is keyed on (workspace_id, warehouse_id).
+JOIN load l ON w.workspace_id = l.workspace_id AND w.warehouse_id = l.warehouse_id
+LEFT JOIN concurrency c ON w.workspace_id = c.workspace_id AND w.warehouse_id = c.warehouse_id
+LEFT JOIN slot_util su ON w.workspace_id = su.workspace_id AND w.warehouse_id = su.warehouse_id
+LEFT JOIN cost cost ON w.workspace_id = cost.workspace_id AND w.warehouse_id = cost.warehouse_id{{ m.cloud_cost_join('cloud_cost', 'w', 'warehouse_id') }}
+-- Enough queries to characterise the load, and clear headroom on every axis:
+-- not queueing (size won't help), not spilling, small scans. Smallest size is
+-- excluded (nothing below it). score() applies the cost floor + prices the step.
+WHERE l.queries >= {{ min_queries }}
+  AND l.queued_pct <= {{ max_queued_pct }}
+  AND l.spilled_pct <= {{ max_spilled_pct }}
+  AND l.p95_read_gb <= {{ max_p95_read_gb }}
+  AND w.warehouse_size <> '2X_SMALL'

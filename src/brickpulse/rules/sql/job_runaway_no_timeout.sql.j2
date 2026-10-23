@@ -1,0 +1,205 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: job_runaway_no_timeout  (Tier 1, B2 — hung / runaway job runs)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate), per RUN via
+--                    billing.usage.usage_metadata.job_run_id.
+--   units:           run wall-seconds = max(period_end) - min(period_start) over the
+--                    run's hourly slices in job_run_timeline. (run_duration_seconds /
+--                    execution_duration_seconds are 0 on every row in the verified
+--                    account, so the slice span is the only usable duration.)
+--   counterfactual:  a run-level timeout of `timeout_p95_multiple` x the job's NORMAL
+--                    p95 (p95 of its non-outlier runs) would have stopped each
+--                    outlier run there. The excess of an outlier run is the SMALLER of
+--                      (a) its billed cost above the job's median run cost, and
+--                      (b) its billed cost x (wall-time past the timeout / wall-time).
+--                    (a) matters: many long serverless runs bill the same as a normal
+--                    run (they wait, not compute — verified live), so a pure
+--                    duration share would credit dollars the timeout never saves.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      excess <= outlier cost <= job cost; closed-open window;
+--                    corrected cost via the canonical price join; coverage-guarded.
+--
+-- Outlier run: wall-time > outlier_multiple x job p50 AND > min_outlier_seconds AND
+-- > job p90. Bimodal guard (score()): a job whose p90/p50 already exceeds
+-- max_p90_p50_ratio has two NORMAL duration modes (e.g. a month-end run) — unless its
+-- outliers mostly ended CANCELLED/ERROR/TIMED_OUT, which is what a hang looks like.
+-- Streaming jobs (job trigger CONTINUOUS, majority-continuous runs, or streaming
+-- backlog health rules) run forever by design and are excluded.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH runs AS (  -- one row per job run in the window (runs are sliced hourly)
+  SELECT
+    workspace_id,
+    job_id,
+    run_id,
+    CAST(MIN(period_start_time) AS DATE) AS run_day,
+    GREATEST(unix_timestamp(MAX(period_end_time)) - unix_timestamp(MIN(period_start_time)), 0)
+      AS dur_s,
+    MAX(result_state) AS result_state,
+    MAX(CASE WHEN trigger_type = 'CONTINUOUS' THEN 1 ELSE 0 END) AS is_continuous
+  FROM {{ tbl('lakeflow','job_run_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    AND run_type = 'JOB_RUN'
+  GROUP BY 1, 2, 3
+),
+job_stats AS (  -- the job's normal duration distribution
+  SELECT
+    workspace_id,
+    job_id,
+    COUNT(*) AS total_runs,
+    COUNT(DISTINCT run_day) AS observed_days,
+    SUM(is_continuous) AS continuous_runs,
+    percentile_approx(dur_s, 0.5) AS p50_s,
+    percentile_approx(dur_s, 0.9) AS p90_s
+  FROM runs
+  GROUP BY 1, 2
+  HAVING COUNT(*) >= {{ min_runs }}
+),
+run_cost AS (  -- real billed cost per individual run, priced via list_prices
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.job_run_id AS run_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.job_run_id IS NOT NULL
+  GROUP BY 1, 2
+),
+classified AS (
+  SELECT
+    r.workspace_id, r.job_id, r.run_id, r.dur_s, r.result_state,
+    s.p50_s, s.p90_s,
+    CASE WHEN r.dur_s > {{ outlier_multiple }} * s.p50_s
+          AND r.dur_s > {{ min_outlier_seconds }}
+          AND r.dur_s > s.p90_s THEN 1 ELSE 0 END AS is_outlier,
+    rc.usd, rc.dbus, rc.unpriced_dbus
+  FROM runs r
+  JOIN job_stats s USING (workspace_id, job_id)
+  LEFT JOIN run_cost rc
+    ON rc.workspace_id = r.workspace_id AND rc.run_id = CAST(r.run_id AS STRING)
+),
+normal AS (  -- the job's healthy range: its non-outlier runs
+  SELECT
+    workspace_id, job_id,
+    percentile_approx(dur_s, 0.95) AS normal_p95_s,
+    percentile_approx(usd, 0.5) AS median_run_usd
+  FROM classified
+  WHERE is_outlier = 0
+  GROUP BY 1, 2
+),
+priced AS (  -- per outlier run: the excess a timeout at the recommended value cuts
+  SELECT
+    c.*,
+    GREATEST({{ timeout_p95_multiple }} * n.normal_p95_s, {{ min_timeout_seconds }}) AS rec_timeout_s,
+    n.normal_p95_s,
+    n.median_run_usd
+  FROM classified c
+  JOIN normal n USING (workspace_id, job_id)
+),
+per_job AS (
+  SELECT
+    workspace_id,
+    job_id,
+    MAX(normal_p95_s) AS normal_p95_s,
+    MAX(rec_timeout_s) AS rec_timeout_s,
+    MAX(median_run_usd) AS median_run_usd,
+    SUM(is_outlier) AS outlier_runs,
+    SUM(CASE WHEN is_outlier = 1 AND result_state IN ('CANCELLED', 'ERROR', 'FAILED', 'TIMED_OUT')
+             THEN 1 ELSE 0 END) AS outlier_unsuccessful_runs,
+    SUM(CASE WHEN is_outlier = 1 AND usd IS NOT NULL THEN 1 ELSE 0 END) AS outlier_billed_runs,
+    MAX(CASE WHEN is_outlier = 1 THEN dur_s END) AS max_outlier_s,
+    SUM(CASE WHEN is_outlier = 1 THEN GREATEST(dur_s - rec_timeout_s, 0) ELSE 0 END)
+      AS excess_wall_s,
+    SUM(CASE WHEN is_outlier = 1 THEN COALESCE(usd, 0) ELSE 0 END) AS outlier_cost_30d,
+    SUM(CASE WHEN is_outlier = 1 AND usd IS NOT NULL AND dur_s > 0 THEN
+          LEAST(GREATEST(usd - COALESCE(median_run_usd, 0), 0),
+                usd * GREATEST(dur_s - rec_timeout_s, 0) / dur_s)
+        ELSE 0 END) AS excess_cost_30d,
+    -- Excess on the runs that ended badly only — what the bimodal-guard exemption
+    -- prices (a long run that SUCCEEDED may be a legitimate second duration mode).
+    SUM(CASE WHEN is_outlier = 1 AND usd IS NOT NULL AND dur_s > 0
+              AND result_state IN ('CANCELLED', 'ERROR', 'FAILED', 'TIMED_OUT') THEN
+          LEAST(GREATEST(usd - COALESCE(median_run_usd, 0), 0),
+                usd * GREATEST(dur_s - rec_timeout_s, 0) / dur_s)
+        ELSE 0 END) AS excess_cost_unsuccessful_30d,
+    SUM(COALESCE(usd, 0)) AS cost_30d_usd,
+    SUM(COALESCE(dbus, 0)) AS dbus_30d,
+    SUM(COALESCE(unpriced_dbus, 0)) AS unpriced_dbus,
+    -- The five longest outlier runs, so the detail view can point at real run ids.
+    slice(
+      array_sort(
+        collect_list(CASE WHEN is_outlier = 1 THEN
+          named_struct('run_id', CAST(run_id AS STRING), 'dur_s', dur_s,
+                       'state', result_state, 'usd', ROUND(COALESCE(usd, 0), 2)) END),
+        (l, r) -> CASE WHEN l.dur_s > r.dur_s THEN -1 WHEN l.dur_s < r.dur_s THEN 1 ELSE 0 END),
+      1, 5) AS top_outlier_runs
+  FROM priced
+  GROUP BY 1, 2
+  HAVING SUM(is_outlier) >= {{ min_outlier_runs }}
+),
+-- Current job + task versions (rank ALL versions, then keep the live one).
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, timeout_seconds, trigger_type, health_rules, delete_time') }},
+{{ m.latest_scd_cte(
+     'latest_tasks',
+     tbl('lakeflow','job_tasks'),
+     'workspace_id, job_id, task_key',
+     select_cols='workspace_id, job_id, task_key, timeout_seconds, delete_time') }},
+task_timeouts AS (
+  SELECT
+    workspace_id, job_id,
+    COUNT(*) AS task_count,
+    SUM(CASE WHEN COALESCE(timeout_seconds, 0) > 0 THEN 1 ELSE 0 END) AS tasks_with_timeout,
+    -- Upper bound on a run's length when EVERY task has a timeout (tasks in series).
+    SUM(COALESCE(timeout_seconds, 0)) AS task_timeout_sum_s
+  FROM latest_tasks
+  GROUP BY 1, 2
+)
+SELECT
+  pj.workspace_id,
+  pj.job_id,
+  COALESCE(lj.job_name, CAST(pj.job_id AS STRING)) AS job_name,
+  js.total_runs,
+  js.observed_days,
+  js.continuous_runs,
+  js.p50_s,
+  js.p90_s,
+  pj.normal_p95_s,
+  pj.rec_timeout_s,
+  pj.median_run_usd,
+  pj.outlier_runs,
+  pj.outlier_unsuccessful_runs,
+  pj.outlier_billed_runs,
+  pj.max_outlier_s,
+  pj.excess_wall_s,
+  ROUND(pj.outlier_cost_30d, 4) AS outlier_cost_30d,
+  ROUND(pj.excess_cost_30d, 4) AS excess_cost_30d,
+  ROUND(pj.excess_cost_unsuccessful_30d, 4) AS excess_cost_unsuccessful_30d,
+  ROUND(pj.cost_30d_usd, 4) AS cost_30d_usd,
+  pj.dbus_30d,
+  pj.unpriced_dbus,
+  pj.top_outlier_runs,
+  COALESCE(lj.timeout_seconds, 0) AS job_timeout_s,
+  lj.trigger_type AS job_trigger_type,
+  COALESCE(tt.task_count, 0) AS task_count,
+  COALESCE(tt.tasks_with_timeout, 0) AS tasks_with_timeout,
+  COALESCE(tt.task_timeout_sum_s, 0) AS task_timeout_sum_s,
+  -- Health rules only ALERT; they never stop a run. Reported, not treated as a bound.
+  COALESCE(exists(lj.health_rules, h -> h.metric = 'RUN_DURATION_SECONDS'), false)
+    AS has_duration_health_rule,
+  COALESCE(exists(lj.health_rules, h -> h.metric LIKE 'STREAMING_BACKLOG%'), false)
+    AS has_streaming_health_rule
+FROM per_job pj
+JOIN job_stats js USING (workspace_id, job_id)
+-- INNER: a deleted job has no future runs to bound.
+JOIN latest_jobs lj
+  ON lj.workspace_id = pj.workspace_id AND lj.job_id = CAST(pj.job_id AS STRING)
+LEFT JOIN task_timeouts tt
+  ON tt.workspace_id = pj.workspace_id AND tt.job_id = CAST(pj.job_id AS STRING)

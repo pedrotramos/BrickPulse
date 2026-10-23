@@ -1,0 +1,266 @@
+{% import '_macros.sql.j2' as m with context %}
+{# PROTOTYPE (recency fix): the DOLLARS and the eligibility gate are sized on a
+   short, recent window (recency_days, default 7) so a resource that ran hot
+   earlier in the 30-day lookback but has since been stopped is no longer sold as
+   ongoing monthly savings. Recurrence detection (is this a *recurring* job?) still
+   uses the full lookback_days window, so a weekly/fortnightly job is not misjudged
+   as a one-off. The recency GATE is the existing
+   "job_active_minutes > 0" filter, which now means "a job ran on this cluster in
+   the last recency_days days". #}
+{% set recency_days = recency_days | default(7) %}
+{% set dedicated_active_frac = dedicated_active_frac | default(0.9) %}
+-- Rule: interactive_to_job
+-- Automated job runs executing on all-purpose (interactive) compute. All-purpose
+-- DBUs cost ~2x job-compute DBUs, so moving recurring jobs to job compute saves
+-- the exact per-DBU price gap.
+--
+-- FORMULA HEADER:
+--   cost basis     : dbx_list (pricing.effective_list) — region-correct ALL_PURPOSE
+--                    vs the same-region JOBS_COMPUTE counterpart, from list_prices.
+--   units          : WALL-CLOCK minutes on BOTH sides of job_active_frac. running
+--                    minutes are DISTINCT clock minutes the cluster had a node up
+--                    (NOT COUNT(*) node-minutes), so the reassignable fraction is
+--                    INVARIANT to cluster size — a job that runs the same wall-clock
+--                    minutes yields the same frac on a 1-node and a 4-node cluster.
+--                    This is the unit bug (wall-clock / node-minutes) fixed.
+--   counterfactual : the cluster's job-active DBUs rebilled at the JOBS_COMPUTE rate;
+--                    the saving is the measured all_purpose-vs-jobs price gap on
+--                    exactly those DBUs (attributed_dbus x (ap_rate - jc_rate)).
+--   savings_status : score() emits BOOKABLE on a job-DEDICATED cluster
+--                    (job_active_frac >= dedicated_active_frac: jobs occupy ~all the
+--                    uptime, so removing them eliminates the all-purpose cluster and
+--                    the gap is realized) — booked as low == point; ESTIMATED on a
+--                    SHARED/interactive cluster (low = 0, because moving the jobs off
+--                    may not shrink the still-interactive cluster; the attributed
+--                    price gap is the UPPER scenario only); ADVISORY when
+--                    list_prices has no JOBS_COMPUTE counterpart to measure the gap.
+--   invariants     : savings <= corrected cost; low <= point <= high; job_active_frac
+--                    is size-invariant; every join/partition keyed (workspace_id,
+--                    cluster_id) so a duplicated id in two workspaces never bleeds.
+--
+-- METHODOLOGY (per-CLUSTER, uptime-attributed):
+--   A shared all-purpose cluster is judged AS A WHOLE, not job-by-job. The
+--   earlier version emitted one row per job and attributed the cluster's DBUs by
+--   each job's share of TOTAL JOB RUNTIME. On a cluster that mostly sits idle
+--   between short bursts that denominator is tiny, so the jobs' shares summed to
+--   ~100% and the whole (largely idle) cluster cost was dumped onto a handful of
+--   trivial runs — three ~11-second jobs on a 99%-idle streaming box each looked
+--   like a $190/mo migration. The idle cost is not a migration saving; it belongs
+--   to auto-termination.
+--
+--   We now attribute by share of the cluster's actual UPTIME. job_active_frac =
+--   distinct clock minutes in which ANY job task ran / distinct clock minutes the
+--   cluster was running. Only that fraction of the cluster's all-purpose DBUs is
+--   reassignable to job compute; the rest is idle/interactive time that migrating
+--   jobs cannot reclaim. The saving is job_active DBUs x (all_purpose_price -
+--   jobs_compute_price) — the true SKU price delta on the DBUs jobs actually
+--   burned, summed across all recurring jobs on the cluster and reported once.
+--
+--   DEDICATED vs SHARED: a cluster whose jobs occupy at least
+--   dedicated_active_frac of its uptime has essentially no interactive/idle time —
+--   it is a job cluster misconfigured as all-purpose, so moving the jobs off
+--   eliminates it and the gap is genuinely realizable (score() books it). Below
+--   that share the cluster is shared/interactive: removing the jobs may leave the
+--   cluster running for interactive use, so the lower bound is $0 (score() keeps it
+--   estimated). is_dedicated carries that classification to score().
+--
+--   Per-job detail (run counts, which jobs) is carried in job_breakdown so the
+--   detail view can still show the constituent jobs, but the recommendation, the
+--   dollars and the min-cost bar are all evaluated on the cluster as a whole.
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the
+-- data layer so this same SQL serves both account-wide precompute and
+-- workspace-scoped live queries.
+-- Current (non-deleted) version of every cluster, via the shared macro:
+-- rank ALL versions per (workspace_id, cluster_id) then keep rn=1 AND delete_time IS
+-- NULL, so a since-deleted cluster is dropped rather than resurrected from an older
+-- live row. This is also PORTABLE: the earlier QUALIFY was DBSQL-only and the hermetic
+-- local-Spark gate could not parse it (same migration warehouse_autostop /
+-- idle_serving_endpoints made).
+WITH
+{{ m.latest_scd_cte('latest_clusters', tbl('compute','clusters'),
+     'workspace_id, cluster_id',
+     select_cols='workspace_id, cluster_id, cluster_name, cluster_source, delete_time') }},
+-- Clusters that are all-purpose (created via UI/API, not job/pipeline compute).
+all_purpose_clusters AS (
+  SELECT workspace_id, cluster_id
+  FROM latest_clusters
+  WHERE cluster_source IN ('UI', 'API')
+),
+-- All-purpose DBUs per cluster over the window (the pool we attribute from),
+-- priced at the REAL rate of each usage row's OWN sku (exact sku_name +
+-- active-price window join) and paired with the same-region JOBS_COMPUTE
+-- counterpart for the migration gap. Blended per-DBU rates are derived from
+-- these totals so the evidence panel reflects the resource's own region, not a
+-- global MAX() across price variants (which picked the priciest regional SKU
+-- regardless of where the resource ran and inflated the dollars several-fold).
+ap_usage AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.cluster_id AS cluster_id,
+    SUM(u.usage_quantity) AS dbus,
+    -- real all-purpose cost of this cluster over the window
+    SUM(u.usage_quantity * {{ m.price_rate('ap_lp') }}) AS ap_cost,
+    -- cost gap vs job compute (0 when no counterpart, e.g. DLT variants) => the
+    -- reassignable saving per DBU, in the resource's own currency/region.
+    SUM(
+      u.usage_quantity * GREATEST(
+        {{ m.price_rate('ap_lp') }}
+          - COALESCE({{ m.price_rate('jc_lp') }}, {{ m.price_rate('ap_lp') }}),
+        0
+      )
+    ) AS gap_cost,
+    -- All-purpose DBUs that found no list price at all: without this the cost
+    -- above would silently shrink toward $0 (see sql/_macros.sql.j2).
+    SUM({{ m.unpriced_dbus('u', 'ap_lp') }}) AS unpriced_dbus{% if contract_prices %},
+    -- COUNTERPART contract pricing (price_basis): the saving is a price GAP, so both
+    -- SKUs are priced at contract rates; a row counts only when BOTH sides (and the
+    -- list side) have a price, and coverage is the share of DBUs where they do.
+    SUM(CASE WHEN ap_ap.sku_name IS NOT NULL AND jc_ap.sku_name IS NOT NULL AND ap_lp.sku_name IS NOT NULL
+             THEN u.usage_quantity * GREATEST({{ m.contract_rate('ap_ap') }} - {{ m.contract_rate('jc_ap') }}, 0) END) AS gap_cost_contract,
+    SUM(CASE WHEN ap_ap.sku_name IS NOT NULL AND jc_ap.sku_name IS NOT NULL AND ap_lp.sku_name IS NOT NULL
+             THEN u.usage_quantity ELSE 0 END) / NULLIF(SUM(u.usage_quantity), 0) AS contract_price_coverage{% endif %}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('ap_lp') }}
+  {{ m.price_join('jc_lp', sku_expr="replace(u.sku_name, 'ALL_PURPOSE_COMPUTE', 'JOBS_COMPUTE')") }}{{ m.contract_price_join('ap_ap') }}{{ m.contract_price_join('jc_ap', sku_expr="replace(u.sku_name, 'ALL_PURPOSE_COMPUTE', 'JOBS_COMPUTE')") }}
+  -- recency window (was lookback_days): size the reassignable spend on what ran
+  -- RECENTLY, closed-open so partial today is excluded.
+  WHERE {{ m.window_lower('u.usage_date', days=recency_days) }}
+    AND u.billing_origin_product = 'ALL_PURPOSE'
+    AND u.usage_metadata.cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- WALL-CLOCK minutes the cluster was actually running (billed), from the node
+-- timeline. This is the denominator for uptime attribution. node_timeline has one
+-- row per NODE per minute, so COUNT(*) would be node-minutes and shrink the
+-- fraction as the cluster grows (the unit bug). COUNT(DISTINCT clock
+-- minute) instead counts the WALL-CLOCK minutes any node was up, matching the
+-- numerator's units so the fraction is invariant to cluster size.
+cluster_running_min AS (
+  SELECT workspace_id, cluster_id,
+         COUNT(DISTINCT date_trunc('MINUTE', start_time)) AS running_minutes,
+         COUNT(DISTINCT CAST(start_time AS DATE)) AS observed_days
+  FROM {{ tbl('compute','node_timeline') }}
+  WHERE {{ m.window_lower('start_time', days=recency_days) }}
+    AND cluster_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Distinct WALL-CLOCK minutes in which ANY job task was running on the cluster.
+-- Deduped across overlapping tasks (two concurrent jobs in the same minute count
+-- once) so the cluster's job-active time is never double-counted. Same units as
+-- running_minutes above. This is the numerator for uptime attribution.
+job_active_min AS (
+  SELECT workspace_id, cluster_id, COUNT(*) AS job_active_minutes
+  FROM (
+    SELECT workspace_id, cluster_id, tm
+    FROM (
+      SELECT t.workspace_id,
+             explode(t.compute_ids) AS cluster_id,
+             explode(sequence(
+               unix_timestamp(date_trunc('MINUTE', t.period_start_time)) DIV 60,
+               unix_timestamp(date_trunc('MINUTE', t.period_end_time)) DIV 60
+             )) AS tm
+      FROM {{ tbl('lakeflow','job_task_run_timeline') }} t
+      -- recency window: job-active minutes used for BOTH the uptime attribution
+      -- and the eligibility gate below, so a cluster idle in the last recency_days
+      -- days produces 0 here and is dropped. Closed-open drops partial today.
+      WHERE {{ m.window_lower('t.period_start_time', days=recency_days) }}
+        AND size(t.compute_ids) > 0
+    )
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+),
+-- Per-job run counts on each cluster (evidence only — how many jobs, how often).
+-- Kept so the detail view can list the constituent jobs of a shared cluster; it
+-- no longer drives attribution or the dollar figure.
+job_runs AS (
+  SELECT
+    s.workspace_id, s.cluster_id, s.job_id,
+    COUNT(DISTINCT s.run_id) AS run_count,
+    SUM(s.runtime_hours) AS runtime_hours
+  FROM (
+    SELECT t.workspace_id,
+           explode(t.compute_ids) AS cluster_id,
+           t.job_id, t.run_id,
+           (unix_timestamp(t.period_end_time) - unix_timestamp(t.period_start_time)) / 3600.0 AS runtime_hours
+    FROM {{ tbl('lakeflow','job_task_run_timeline') }} t
+    WHERE {{ m.window_lower('t.period_start_time') }}
+      AND size(t.compute_ids) > 0
+  ) s
+  JOIN all_purpose_clusters ac
+    ON s.workspace_id = ac.workspace_id AND s.cluster_id = ac.cluster_id
+  GROUP BY 1, 2, 3
+),
+-- Cluster-level rollup of the jobs: how many recurring jobs, total runs, and a
+-- compact per-job breakdown for the evidence panel.
+cluster_jobs AS (
+  SELECT
+    workspace_id, cluster_id,
+    COUNT(DISTINCT job_id) AS job_count,
+    SUM(run_count) AS run_count,
+    SUM(runtime_hours) AS job_runtime_hours,
+    -- Recurring jobs only (>= min_runs) so a one-off run doesn't inflate the
+    -- job count that gates the recommendation.
+    COUNT(DISTINCT CASE WHEN run_count >= {{ min_runs }} THEN job_id END) AS recurring_job_count,
+    slice(
+      array_sort(
+        collect_list(struct(run_count AS runs, job_id AS job_id, runtime_hours AS hours)),
+        (l, r) -> CASE WHEN l.runs > r.runs THEN -1 WHEN l.runs < r.runs THEN 1 ELSE 0 END
+      ), 1, 12
+    ) AS job_breakdown
+  FROM job_runs
+  GROUP BY 1, 2
+)
+SELECT
+  ac.workspace_id,
+  ac.cluster_id,
+  lc.cluster_name,
+  cj.job_count,
+  cj.recurring_job_count,
+  cj.run_count,
+  ROUND(cj.job_runtime_hours, 2) AS runtime_hours,
+  cj.job_breakdown,
+  COALESCE(crm.running_minutes, 0) AS running_minutes,
+  COALESCE(jam.job_active_minutes, 0) AS job_active_minutes,
+  COALESCE(crm.observed_days, 0) AS observed_days,
+  -- Share of the cluster's billed WALL-CLOCK uptime during which a job task was
+  -- running. The reassignable fraction: only these DBUs move with the jobs to job
+  -- compute. CAPPED AT 1.0: job-task minutes (lakeflow) and running minutes
+  -- (node_timeline) come from different telemetry, and when node_timeline
+  -- under-reports the cluster's running time the raw ratio can exceed 1; a job
+  -- cannot be active more than the cluster ran, so clamp. The attributed DBUs,
+  -- cost and savings below all use this capped fraction and so never exceed the
+  -- metered spend.
+  LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0) AS job_active_frac,
+  -- DEDICATED (job-only) vs SHARED (interactive) classification for score(): jobs
+  -- occupy >= dedicated_active_frac of the uptime => essentially no interactive/idle
+  -- time => removing the jobs eliminates the all-purpose cluster (bookable). See
+  -- the formula header.
+  (LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0)
+     >= {{ dedicated_active_frac }}) AS is_dedicated,
+  ROUND(ap.dbus, 2) AS dbus_30d,
+  ap.unpriced_dbus,
+  -- Job-active DBUs and their all-purpose cost / migration gap: the cluster's
+  -- totals scaled by the uptime share jobs actually used.
+  ROUND(ap.dbus * LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0), 2) AS attributed_dbus,
+  ROUND(ap.ap_cost * LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0), 2) AS cost_30d_usd,
+  ROUND(ap.gap_cost * LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0), 2) AS savings_30d_usd,{% if contract_prices %}
+  ROUND(ap.gap_cost_contract * LEAST(COALESCE(jam.job_active_minutes, 0) / NULLIF(crm.running_minutes, 0), 1.0), 2) AS savings_30d_contract_usd,
+  ap.contract_price_coverage,{% endif %}
+  -- Blended per-DBU rates for the evidence panel (region-correct, from real cost).
+  ROUND(ap.ap_cost / NULLIF(ap.dbus, 0), 4) AS price_all_purpose,
+  ROUND((ap.ap_cost - ap.gap_cost) / NULLIF(ap.dbus, 0), 4) AS price_jobs_compute
+FROM all_purpose_clusters ac
+JOIN cluster_jobs cj USING (workspace_id, cluster_id)
+JOIN ap_usage ap USING (workspace_id, cluster_id)
+LEFT JOIN cluster_running_min crm USING (workspace_id, cluster_id)
+LEFT JOIN job_active_min jam USING (workspace_id, cluster_id)
+LEFT JOIN latest_clusters lc USING (workspace_id, cluster_id)
+-- Must have at least one recurring job (detected over the full lookback window)
+-- AND job activity in the RECENCY window. The second clause is the recency GATE:
+-- jam is now measured over recency_days, so a cluster whose jobs stopped days ago
+-- has job_active_minutes = 0 and is dropped instead of being sold as ongoing
+-- savings from stale usage.
+WHERE cj.recurring_job_count >= 1
+  AND COALESCE(jam.job_active_minutes, 0) > 0

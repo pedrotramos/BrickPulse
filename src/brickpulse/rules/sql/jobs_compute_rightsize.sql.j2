@@ -1,0 +1,150 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: jobs_compute_rightsize (over-provisioned JOB compute)
+-- Job clusters are EPHEMERAL: a job spins up a fresh cluster per run (hundreds of
+-- millions of distinct JOB cluster_ids fleet-wide in a month), so -- unlike the
+-- all-purpose rightsize rule, which groups by a persistent cluster_id -- we
+-- aggregate utilization by the recurring JOB across all of its run-clusters in the
+-- window.
+--
+-- node_timeline carries a `driver` boolean, so we separate DRIVER from WORKER
+-- utilization. That split is what catches the waste the all-purpose rule cannot
+-- see:
+--   * driver-bound  -- workers idle while the driver does all the work (a
+--                      python/pandas job that should run single-node);
+--   * idle workers  -- too many workers, all lightly used;
+--   * memory oversize-- far more memory provisioned than the workload touches.
+-- score() classifies the dominant symptom and prices a conservative saving.
+--
+-- node_timeline has no job_id, so the ephemeral cluster -> job mapping comes from
+-- billing.usage.usage_metadata (both cluster_id and job_id are populated for jobs
+-- compute). Cost is the REAL billed spend per job (usage x list_prices).
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the data
+-- layer so this same SQL serves account-wide precompute and workspace-scoped live
+-- queries.
+WITH cluster_job AS (  -- ephemeral job-cluster -> its job, from billing metadata
+  SELECT DISTINCT
+    workspace_id,
+    usage_metadata.cluster_id AS cluster_id,
+    usage_metadata.job_id AS job_id
+  FROM {{ tbl('billing','usage') }}
+  WHERE {{ m.window_lower('usage_date') }}
+    AND usage_metadata.cluster_id IS NOT NULL
+    AND usage_metadata.job_id IS NOT NULL
+),
+-- real billed cost per job over the window, priced via list_prices:
+{{ m.usage_cost_cte('job_cost', 'u.usage_metadata.job_id', 'job_id') }},{% if cloud_costs %}
+-- Classic cloud VM cost per job (price_basis, cloud_infra_cost): the job's ephemeral
+-- run-clusters' VM cost, mapped cluster -> job through cluster_job above.
+job_cloud AS (
+  SELECT cj.workspace_id, cj.job_id, SUM(CAST(ci.cost AS DOUBLE)) AS cloud_cost_30d_usd
+  FROM cluster_job cj
+  JOIN {{ tbl('billing','cloud_infra_cost') }} ci
+    ON ci.workspace_id = cj.workspace_id AND ci.usage_metadata.cluster_id = cj.cluster_id
+  WHERE {{ m.window_lower('ci.usage_date') }}
+    AND ci.currency_code = '{{ currency }}'
+  GROUP BY 1, 2
+),{% endif %}
+node AS (  -- per-node utilization samples for the job's run-clusters, driver-tagged
+  SELECT
+    cj.workspace_id,
+    cj.job_id,
+    n.cluster_id,
+    n.driver,
+    n.cpu_user_percent + n.cpu_system_percent AS cpu,
+    n.mem_used_percent AS mem,
+    CAST(n.start_time AS DATE) AS day
+  FROM {{ tbl('compute','node_timeline') }} n
+  JOIN cluster_job cj USING (workspace_id, cluster_id)
+  WHERE {{ m.window_lower('n.start_time') }}
+),
+per_job_util AS (
+  SELECT
+    workspace_id,
+    job_id,
+    -- Driver vs worker averages across the window. worker_* is NULL for a job that
+    -- ran single-node (no worker samples); score() reads has_workers to tell apart
+    -- "workers idle" from "no workers at all".
+    AVG(CASE WHEN driver THEN cpu END) AS driver_cpu,
+    AVG(CASE WHEN NOT driver THEN cpu END) AS worker_cpu,
+    AVG(CASE WHEN driver THEN mem END) AS driver_mem,
+    AVG(CASE WHEN NOT driver THEN mem END) AS worker_mem,
+    -- p95 PEAKS on the same 0-100 scale. The average hides a burst the
+    -- compute exists to serve: a job idle on average but spiking at p95 needs its
+    -- workers/memory at peak. score() uses these to VETO a downsize the average
+    -- alone would flag, so bursty jobs correctly drop out.
+    percentile_approx(CASE WHEN NOT driver THEN cpu END, 0.95) AS worker_p95_cpu,
+    percentile_approx(CASE WHEN driver THEN cpu END, 0.95) AS driver_p95_cpu,
+    percentile_approx(CASE WHEN NOT driver THEN mem END, 0.95) AS worker_p95_mem,
+    percentile_approx(CASE WHEN driver THEN mem END, 0.95) AS driver_p95_mem,
+    MAX(CASE WHEN NOT driver THEN 1 ELSE 0 END) AS has_workers,
+    -- Distinct run-clusters (~= runs) and distinct days seen, so a one-off run on a
+    -- huge cluster is not sized on a single sample (see finops_rules.history).
+    COUNT(DISTINCT cluster_id) AS run_clusters,
+    COUNT(DISTINCT day) AS observed_days
+  FROM node
+  GROUP BY 1, 2
+),
+latest_cfg AS (  -- the job's most recent JOB cluster config (worker count, node types)
+  -- rank-then-filter (not QUALIFY) so the SQL is portable to open-source Spark too;
+  -- semantically identical to QUALIFY ROW_NUMBER()=1.
+  SELECT workspace_id, job_id, cluster_name, worker_count,
+         driver_node_type, worker_node_type
+  FROM (
+    SELECT
+      cj.workspace_id, cj.job_id, c.cluster_name, c.worker_count,
+      c.driver_node_type, c.worker_node_type,
+      ROW_NUMBER() OVER (
+        PARTITION BY cj.workspace_id, cj.job_id ORDER BY c.change_time DESC
+      ) AS rn
+    FROM {{ tbl('compute','clusters') }} c
+    JOIN cluster_job cj USING (workspace_id, cluster_id)
+    WHERE c.cluster_source = 'JOB'
+  )
+  WHERE rn = 1
+),
+node_types AS (  -- dedupe node-type specs (the table can have per-account/region rows)
+  SELECT node_type, MAX(core_count) AS core_count, MAX(memory_mb) AS memory_mb
+  FROM {{ tbl('compute','node_types') }}
+  GROUP BY node_type
+),
+-- Current job version: rank ALL versions, then keep the live one.
+{{ m.latest_scd_cte(
+     'latest_jobs',
+     tbl('lakeflow','jobs'),
+     'workspace_id, job_id',
+     select_cols='workspace_id, job_id, name AS job_name, delete_time') }}
+SELECT
+  u.workspace_id,
+  u.job_id,
+  lj.job_name,
+  cfg.cluster_name,
+  cfg.worker_count,
+  cfg.driver_node_type,
+  cfg.worker_node_type,
+  dnt.core_count AS driver_cores,
+  dnt.memory_mb AS driver_memory_mb,
+  wnt.core_count AS worker_cores,
+  wnt.memory_mb AS worker_memory_mb,
+  u.driver_cpu,
+  u.worker_cpu,
+  u.driver_mem,
+  u.worker_mem,
+  u.worker_p95_cpu,
+  u.driver_p95_cpu,
+  u.worker_p95_mem,
+  u.driver_p95_mem,
+  u.has_workers,
+  u.run_clusters,
+  u.observed_days,
+  COALESCE(jc.cost_30d_usd, 0) AS cost_30d_usd{{ m.contract_cost_select('jc', lead=True) }}{{ m.cloud_cost_select('jcl', lead=True) }}
+FROM per_job_util u
+LEFT JOIN latest_cfg cfg USING (workspace_id, job_id)
+LEFT JOIN latest_jobs lj USING (workspace_id, job_id)
+LEFT JOIN job_cost jc USING (workspace_id, job_id){% if cloud_costs %}
+LEFT JOIN job_cloud jcl USING (workspace_id, job_id){% endif %}
+LEFT JOIN node_types dnt ON cfg.driver_node_type = dnt.node_type
+LEFT JOIN node_types wnt ON cfg.worker_node_type = wnt.node_type
+-- Only jobs with real billed compute and enough runs to be a stable pattern.
+WHERE COALESCE(jc.cost_30d_usd, 0) > 0
+  AND u.run_clusters >= {{ min_runs }}

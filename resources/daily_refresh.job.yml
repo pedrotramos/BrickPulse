@@ -1,0 +1,31 @@
+# Runs the pipeline, then the "Saved so far" tracker, which keeps its own history
+# tables (plain Delta, not pipeline outputs).
+resources:
+  jobs:
+    daily_refresh:
+      name: "[BrickPulse] Daily refresh (${var.catalog}.${var.schema})"
+      tags:
+        project: brickpulse
+      max_concurrent_runs: 1
+      schedule:
+        quartz_cron_expression: "0 0 5 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      tasks:
+        - task_key: run_pipeline
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.precompute.id}
+        - task_key: track_changes
+          depends_on:
+            - task_key: run_pipeline
+          environment_key: default
+          spark_python_task:
+            python_file: ../src/brickpulse/pipelines/change_tracker.py
+            parameters:
+              - ${var.catalog}.${var.schema}
+      environments:
+        - environment_key: default
+          spec:
+            client: "2"
+            dependencies:
+              - ../dist/*.whl

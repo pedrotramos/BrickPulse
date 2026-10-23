@@ -1,0 +1,249 @@
+{% import '_macros.sql.j2' as m with context %}
+{% set hd = lookback_days %}
+-- Rule: warehouse_min_clusters
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list, via usage_cost_cte) spread over the
+--                    warehouse's REBUILT cluster-minutes -> a measured $/cluster-minute
+--                    (auto-handles size, serverless vs pro, and restart overheads).
+--   units:           cluster-minutes, reconstructed from the warehouse_events sequence
+--                    (STARTING / RUNNING / SCALED_UP / SCALED_DOWN / STOPPING / STOPPED
+--                    each carry the cluster_count AFTER the event). Each event opens a
+--                    segment that lasts until the next event; a segment is split per
+--                    minute with its exact overlap in seconds.
+--   counterfactual:  min_clusters = 1. In a running minute the floor holds
+--                    LEAST(actual, min_clusters) clusters; with min 1 the warehouse
+--                    would have held GREATEST(1, needed) of them, where needed =
+--                    CEIL(queries overlapping that minute / max_queries_per_cluster).
+--                    Clusters the AUTOSCALER added above the floor are untouched (it
+--                    would add them with min 1 too). excess = the difference, priced.
+--                    "Queries overlapping a minute" >= true peak concurrency, so needed
+--                    is over-, and the saving under-, estimated.
+--   phased step:     the FIRST step of the phased plan (finops_rules.phasing, 3x per
+--                    step: 30 -> 10 -> 4 -> 2 -> 1) is step_min_clusters =
+--                    GREATEST(1, CEIL(min_clusters / {{ phasing_max_step_ratio }})), priced the same
+--                    way in the SAME pass (step_excess_cluster_min): the clusters held
+--                    with min = step would be GREATEST(step, needed). score() checks
+--                    step_min_clusters against phasing.count_plan()[0].
+--   why minutes, not billed hours: the costly shape is a warehouse woken dozens of
+--                    times an hour by short queries, each start bringing up
+--                    min_clusters clusters that sit out the idle timer. At hourly
+--                    grain every hour looks busy and the excess vanishes.
+--   savings_status:  estimated (promoted 2026-09-23): shown and ranked, not booked.
+--   invariants:      excess_cluster_min <= floor_cluster_min <= actual_cluster_min;
+--                    step_excess_cluster_min <= excess_cluster_min;
+--                    closed-open {{ hd }}-day window on events, query.history, billing;
+--                    state at the window start carried in from the last prior event.
+--
+-- Candidates: CURRENT min_clusters > 1, any warehouse type (serverless included — a
+-- serverless warehouse at the auto-stop floor with min_clusters > 1 slips past every
+-- other rule).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH {{ m.latest_scd_cte(
+     'wh',
+     tbl('compute','warehouses'),
+     'workspace_id, warehouse_id',
+     select_cols='workspace_id, warehouse_id, warehouse_name, warehouse_type, warehouse_size, min_clusters, max_clusters, auto_stop_minutes, delete_time') }},
+candidates AS (
+  SELECT *,
+         -- First step of the phased plan (finops_rules.phasing.count_plan(min, 1)[0]).
+         GREATEST(1, CAST(CEIL(min_clusters / {{ phasing_max_step_ratio }}) AS INT)) AS step_min_clusters
+  FROM wh WHERE COALESCE(min_clusters, 1) > 1
+),
+ev_window AS (  -- events inside the window
+  SELECT e.workspace_id, e.warehouse_id, e.event_time, e.event_type,
+         COALESCE(e.cluster_count, 0) AS cluster_count
+  FROM {{ tbl('compute','warehouse_events') }} e
+  JOIN candidates c ON c.workspace_id = e.workspace_id AND c.warehouse_id = e.warehouse_id
+  WHERE {{ m.window_lower('e.event_time', hd) }}
+),
+ev_carry AS (  -- state at the window start: the last event before it (an always-on
+               -- warehouse may have no STARTING event inside the window at all).
+               -- Deliberately BEFORE the window, so its bounds are written as interval
+               -- arithmetic rather than window_lower(); start = the window's lower bound.
+  SELECT workspace_id, warehouse_id,
+         CAST(current_date() AS TIMESTAMP) - INTERVAL {{ hd }} DAYS AS event_time,
+         'CARRY_IN' AS event_type, cluster_count
+  FROM (
+    SELECT e.workspace_id, e.warehouse_id, COALESCE(e.cluster_count, 0) AS cluster_count,
+           ROW_NUMBER() OVER (PARTITION BY e.workspace_id, e.warehouse_id
+                              ORDER BY e.event_time DESC) AS rn
+    FROM {{ tbl('compute','warehouse_events') }} e
+    JOIN candidates c ON c.workspace_id = e.workspace_id AND c.warehouse_id = e.warehouse_id
+    WHERE e.event_time >= CAST(current_date() AS TIMESTAMP) - INTERVAL {{ hd + carry_in_days }} DAYS
+      AND e.event_time < CAST(current_date() AS TIMESTAMP) - INTERVAL {{ hd }} DAYS
+  )
+  WHERE rn = 1
+),
+ev AS (SELECT * FROM ev_window UNION ALL SELECT * FROM ev_carry),
+segments AS (  -- [event_time, next event) at cluster_count clusters; last one ends at window end
+  SELECT workspace_id, warehouse_id, cluster_count,
+         event_time AS seg_start,
+         COALESCE(LEAD(event_time) OVER (PARTITION BY workspace_id, warehouse_id
+                                         ORDER BY event_time, event_type),
+                  CAST(current_date() AS TIMESTAMP)) AS seg_end
+  FROM ev
+),
+seg_minutes AS (  -- each running segment split per minute, weighted by its exact overlap
+  SELECT workspace_id, warehouse_id, cluster_count, minute,
+         (unix_timestamp(LEAST(seg_end, minute + INTERVAL 1 MINUTE))
+          - unix_timestamp(GREATEST(seg_start, minute))) / 60.0 AS frac
+  FROM (
+    SELECT *, explode(sequence(date_trunc('MINUTE', seg_start),
+                               date_trunc('MINUTE', seg_end - INTERVAL 1 MILLISECOND),
+                               INTERVAL 1 MINUTE)) AS minute
+    FROM segments
+    WHERE cluster_count > 0 AND seg_end > seg_start
+  )
+),
+q AS (  -- every query on a candidate warehouse in the window
+  SELECT qh.workspace_id, qh.compute.warehouse_id AS warehouse_id,
+         qh.start_time,
+         GREATEST(COALESCE(qh.end_time, qh.start_time), qh.start_time) AS end_time,
+         COALESCE(qh.waiting_at_capacity_duration_ms, 0) AS wait_ms,
+         COALESCE(qh.client_application, 'unknown') AS client_application,
+         qh.executed_by
+  FROM {{ tbl('query','history') }} qh
+  JOIN candidates c ON c.workspace_id = qh.workspace_id AND c.warehouse_id = qh.compute.warehouse_id
+  WHERE {{ m.window_lower('qh.start_time', hd) }}
+),
+q_minutes AS (  -- queries overlapping each minute (>= true peak concurrency: conservative)
+  SELECT workspace_id, warehouse_id, minute, COUNT(*) AS conc
+  FROM (
+    SELECT workspace_id, warehouse_id,
+           explode(sequence(date_trunc('MINUTE', start_time), date_trunc('MINUTE', end_time),
+                            INTERVAL 1 MINUTE)) AS minute
+    FROM q
+  )
+  GROUP BY 1, 2, 3
+),
+minute_class AS (
+  SELECT s.workspace_id, s.warehouse_id, s.minute, s.frac, s.cluster_count,
+         c.min_clusters, c.step_min_clusters,
+         CAST(CEIL(COALESCE(qm.conc, 0) / {{ max_queries_per_cluster }}) AS INT) AS needed
+  FROM seg_minutes s
+  JOIN candidates c ON c.workspace_id = s.workspace_id AND c.warehouse_id = s.warehouse_id
+  LEFT JOIN q_minutes qm
+    ON qm.workspace_id = s.workspace_id AND qm.warehouse_id = s.warehouse_id
+   AND qm.minute = s.minute
+),
+per_wh_day AS (  -- per day first, so the chart and the totals share one pass
+  SELECT workspace_id, warehouse_id, CAST(minute AS DATE) AS day,
+         SUM(frac * cluster_count) AS actual_cluster_min,
+         SUM(frac * LEAST(cluster_count, min_clusters)) AS floor_cluster_min,
+         SUM(frac * GREATEST(0, LEAST(cluster_count, min_clusters) - GREATEST(1, needed)))
+           AS excess_cluster_min,
+         -- The same, for the first phased step (min = step_min_clusters instead of 1).
+         SUM(frac * GREATEST(0, LEAST(cluster_count, min_clusters)
+                                - GREATEST(step_min_clusters, needed)))
+           AS step_excess_cluster_min,
+         -- Running wall-clock minutes, and those where ONE cluster covers the load:
+         -- the R3 guard (only recommend when 1 cluster suffices most of the time).
+         SUM(frac) AS running_min,
+         SUM(CASE WHEN needed <= 1 THEN frac ELSE 0 END) AS one_cluster_min,
+         SUM(CASE WHEN needed = 0 THEN frac ELSE 0 END) AS no_query_min,
+         MAX(needed) AS peak_needed
+  FROM minute_class
+  GROUP BY 1, 2, 3
+),
+per_wh_min AS (
+  SELECT workspace_id, warehouse_id,
+         SUM(actual_cluster_min) AS actual_cluster_min,
+         SUM(floor_cluster_min) AS floor_cluster_min,
+         SUM(excess_cluster_min) AS excess_cluster_min,
+         SUM(step_excess_cluster_min) AS step_excess_cluster_min,
+         SUM(running_min) AS running_min,
+         SUM(one_cluster_min) AS one_cluster_min,
+         SUM(no_query_min) AS no_query_min,
+         MAX(peak_needed) AS peak_needed,
+         -- Per-day cluster-hours for the chart: w = held and needed (or added by the
+         -- autoscaler), x = held only by the floor (the excess).
+         transform(
+           array_sort(collect_list(struct(day AS d, actual_cluster_min AS a,
+                                          excess_cluster_min AS e)),
+                      (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+           x -> named_struct('d', CAST(x.d AS STRING),
+                             'w', ROUND((x.a - x.e) / 60.0, 2),
+                             'x', ROUND(x.e / 60.0, 2))
+         ) AS days
+  FROM per_wh_day
+  GROUP BY 1, 2
+),
+starts AS (
+  SELECT workspace_id, warehouse_id,
+         SUM(CASE WHEN event_type = 'STARTING' THEN 1 ELSE 0 END) AS starts,
+         COUNT(DISTINCT CAST(event_time AS DATE)) AS event_days
+  FROM ev_window
+  GROUP BY 1, 2
+),
+load AS (
+  SELECT workspace_id, warehouse_id,
+         COUNT(*) AS queries,
+         SUM(CASE WHEN wait_ms > 0 THEN 1 ELSE 0 END) / COUNT(*) AS queued_pct,
+         PERCENTILE(wait_ms, 0.95) / 1000.0 AS p95_queue_wait_s,
+         PERCENTILE((unix_millis(end_time) - unix_millis(start_time)) / 1000.0, 0.5)
+           AS p50_duration_s,
+         COUNT(DISTINCT date_trunc('HOUR', start_time)) AS query_hours,
+         COUNT(DISTINCT HOUR(start_time)) AS hours_of_day_active
+  FROM q
+  GROUP BY 1, 2
+),
+-- Who sends the queries, so `how` can name the second remedy (batch the service's
+-- polling, or give it a small dedicated warehouse). Top 3 by statement count.
+client_counts AS (
+  SELECT workspace_id, warehouse_id, client_application, executed_by, COUNT(*) AS n
+  FROM q
+  GROUP BY 1, 2, 3, 4
+),
+clients AS (
+  SELECT workspace_id, warehouse_id,
+         collect_list(named_struct('client', client_application, 'user', executed_by, 'n', n))
+           AS top_clients
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace_id, warehouse_id ORDER BY n DESC) AS rn
+    FROM client_counts
+  )
+  WHERE rn <= 3
+  GROUP BY 1, 2
+),
+{{ m.usage_cost_cte('cost', 'u.usage_metadata.warehouse_id', 'warehouse_id') }}
+SELECT
+  c.workspace_id,
+  c.warehouse_id,
+  c.warehouse_name,
+  c.warehouse_type,
+  c.warehouse_size,
+  c.min_clusters,
+  c.max_clusters,
+  c.auto_stop_minutes,
+  c.step_min_clusters,
+  ROUND(p.actual_cluster_min, 1) AS actual_cluster_min,
+  ROUND(p.floor_cluster_min, 1) AS floor_cluster_min,
+  ROUND(p.excess_cluster_min, 1) AS excess_cluster_min,
+  ROUND(p.step_excess_cluster_min, 1) AS step_excess_cluster_min,
+  ROUND(p.running_min, 1) AS running_min,
+  ROUND(p.one_cluster_min, 1) AS one_cluster_min,
+  ROUND(p.no_query_min, 1) AS no_query_min,
+  p.peak_needed,
+  p.days,
+  COALESCE(s.starts, 0) AS starts,
+  COALESCE(l.queries, 0) AS queries,
+  COALESCE(ROUND(l.queued_pct, 4), 0) AS queued_pct,
+  COALESCE(ROUND(l.p95_queue_wait_s, 2), 0) AS p95_queue_wait_s,
+  ROUND(l.p50_duration_s, 2) AS p50_duration_s,
+  COALESCE(l.query_hours, 0) AS query_hours,
+  COALESCE(l.hours_of_day_active, 0) AS hours_of_day_active,
+  cl.top_clients,
+  COALESCE(k.cost_30d_usd, 0) AS cost_window_usd,
+  COALESCE(k.dbus_30d, 0) AS dbus_30d,
+  COALESCE(k.unpriced_dbus, 0) AS unpriced_dbus,
+  -- Distinct billed days: a pattern, not one afternoon (finops_rules.history).
+  COALESCE(k.observed_days, 0) AS observed_days
+FROM candidates c
+JOIN per_wh_min p ON p.workspace_id = c.workspace_id AND p.warehouse_id = c.warehouse_id
+LEFT JOIN starts s ON s.workspace_id = c.workspace_id AND s.warehouse_id = c.warehouse_id
+LEFT JOIN load l ON l.workspace_id = c.workspace_id AND l.warehouse_id = c.warehouse_id
+LEFT JOIN clients cl ON cl.workspace_id = c.workspace_id AND cl.warehouse_id = c.warehouse_id
+LEFT JOIN cost k ON k.workspace_id = c.workspace_id AND k.warehouse_id = c.warehouse_id
+WHERE p.excess_cluster_min > 0

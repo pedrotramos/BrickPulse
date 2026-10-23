@@ -1,0 +1,215 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: idle_serving_endpoints
+-- Model serving endpoints that bill CONTINUOUSLY but serve (almost) no traffic.
+--
+-- METHODOLOGY (request-level evidence — the strongest signal any rule here has):
+--   system.serving.endpoint_usage is a per-REQUEST log, so unlike every other
+--   idleness rule in this catalog we do not infer "unused" from a proxy: we count
+--   the actual inference requests. Joined to per-endpoint cost from
+--   billing.usage (usage_metadata.endpoint_id) x list_prices.
+--
+--   THE CRITICAL GATE — only endpoints that bill WHILE IDLE can have idle waste.
+--   Verified on a live account (14-day window, CUSTOM_MODEL endpoints):
+--       min_concurrency > 0  ->  5 endpoints, billed 15.0/15 days, avg 2806 DBU
+--       scale-to-zero        ->  6 endpoints, billed  5.8/15 days, avg  277 DBU
+--   A scale-to-zero endpoint costs ~nothing when nobody calls it, so
+--   "delete this idle endpoint" would save $0 and just insult the reader. We
+--   therefore keep ONLY:
+--     * PROVISIONED_THROUGHPUT usage (always-on reserved capacity), or
+--     * CUSTOM_MODEL / FEATURE_SPEC endpoints with min_concurrency > 0
+--       (scale-to-zero explicitly disabled => warm replicas billed 24/7).
+--   Pay-per-token Foundation Model and external-model endpoints are EXCLUDED:
+--   they bill per request, so an idle one is already free.
+--
+--   THE CRITICAL FALSE-POSITIVE GUARD — served_entities does NOT cover every
+--   billing endpoint (measured: only 92 of 591 billing endpoint_ids matched over
+--   14 days). A missing join therefore reads as "no traffic" and would have us
+--   confidently recommend deleting BUSY endpoints. So we INNER JOIN the entity
+--   dimension and emit `entity_matched`; absence is "unknown", never "idle".
+--
+--   THE SECOND BLIND SPOT — endpoint_usage only logs requests for endpoints with
+--   USAGE TRACKING enabled, and no system table says whether it is on. Zero logged
+--   requests is therefore either "nobody calls it" or "nobody records the calls".
+--   Measured on a test account (2026-09-23): of 40 zero-traffic candidates,
+--   35 had NEVER logged a request in the table's whole retained history (~90 days)
+--   — idle and untracked look identical. So we also count requests over the
+--   entire retained history (`requests_retained`): an endpoint that logged calls
+--   before and then went quiet PROVES tracking works (measured idle); one that has
+--   never logged anything is UNVERIFIED and score() says so loudly.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH
+-- Current definition per endpoint. served_entities is a slow-changing dimension
+-- (measured 769 rows -> 509 endpoints), so collapse to the latest row per
+-- (workspace, endpoint) and drop endpoints already deleted. the shared
+-- latest_scd_cte ranks ALL versions then keeps rn=1 AND <delete_col> IS NULL, so a
+-- deleted-latest endpoint is dropped (never resurrecting an older live version) —
+-- and it is portable Spark SQL, unlike the QUALIFY it replaces (DBSQL-only, so the
+-- hermetic sample gate could not run this rule). delete_col names the non-default
+-- deletion column for this table.
+{{ m.latest_scd_cte(
+     'latest_entities', tbl('serving','served_entities'),
+     'workspace_id, endpoint_id',
+     select_cols='workspace_id, endpoint_id, endpoint_name, served_entity_id, '
+                 'entity_type, entity_name, created_by, custom_model_config, '
+                 'feature_spec_config, endpoint_delete_time',
+     delete_col='endpoint_delete_time') }},
+endpoints AS (
+  SELECT
+    workspace_id,
+    endpoint_id,
+    endpoint_name,
+    entity_type,
+    entity_name,
+    created_by,
+    -- min_concurrency lives on a different struct per entity type.
+    COALESCE(
+      custom_model_config.min_concurrency,
+      feature_spec_config.min_concurrency
+    ) AS min_concurrency,
+    COALESCE(
+      custom_model_config.compute_type,
+      feature_spec_config.compute_type
+    ) AS compute_type
+  FROM latest_entities                 -- already filtered to the live latest row
+),
+-- Every served_entity_id that ever belonged to an endpoint, so request rows
+-- logged against an OLDER config version still count as traffic. Using only the
+-- latest served_entity_id would undercount requests and manufacture idleness.
+entity_versions AS (
+  SELECT DISTINCT workspace_id, endpoint_id, served_entity_id
+  FROM {{ tbl('serving','served_entities') }}
+),
+-- Per-endpoint cost + how many distinct days it actually billed. days_billed is
+-- the always-on evidence: a continuously-billing endpoint bills every day.
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.endpoint_id AS endpoint_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_window_usd,
+    SUM(u.usage_quantity) AS dbus_window,
+    -- usage that found no list price, so the coverage guard can fail
+    -- closed on an endpoint whose cost we cannot fully price (this rule books the
+    -- zero-traffic tier, so an incomplete price must not read as a confident $).
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_window,
+    COUNT(DISTINCT u.usage_date) AS days_billed,
+    MAX(CASE WHEN u.product_features.model_serving.offering_type = 'PROVISIONED_THROUGHPUT'
+             THEN 1 ELSE 0 END) AS is_provisioned_throughput,
+    MAX(CASE WHEN u.product_features.model_serving.offering_type = 'BATCH_INFERENCE'
+             THEN 1 ELSE 0 END) AS is_batch_inference{{ m.contract_cost_cols() }}
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}{{ m.contract_price_join() }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.billing_origin_product = 'MODEL_SERVING'
+    AND u.usage_metadata.endpoint_id IS NOT NULL
+  GROUP BY 1, 2
+),
+-- Actual inference requests in the window, across all config versions.
+-- served_entity_id is globally unique (one served entity belongs to one
+-- endpoint in one workspace), so the served_entity_id join carries the correct
+-- workspace_id from entity_versions and cannot bleed across workspaces.
+requests AS (
+  SELECT
+    ev.workspace_id,
+    ev.endpoint_id,
+    COUNT(*) AS requests_window,
+    COUNT(DISTINCT CAST(u.request_time AS DATE)) AS request_days,
+    COUNT(DISTINCT u.requester) AS distinct_requesters,
+    MAX(u.request_time) AS last_request_time,
+    SUM(CASE WHEN u.status_code >= 200 AND u.status_code < 300 THEN 1 ELSE 0 END) AS ok_requests
+  FROM {{ tbl('serving','endpoint_usage') }} u
+  JOIN entity_versions ev
+    ON ev.served_entity_id = u.served_entity_id
+  WHERE {{ m.window_lower('u.request_time') }}
+  GROUP BY 1, 2
+),
+-- Requests over the WHOLE retained history (no window), per endpoint: the only
+-- evidence that usage tracking is recording this endpoint at all (see header).
+-- Pre-aggregated per served entity so the 100M+-row log is scanned once.
+retained AS (
+  SELECT ev.workspace_id, ev.endpoint_id,
+         SUM(u.n) AS requests_retained,
+         MAX(u.last_time) AS last_request_retained
+  FROM (
+    SELECT served_entity_id, COUNT(*) AS n, MAX(request_time) AS last_time
+    FROM {{ tbl('serving','endpoint_usage') }}
+    GROUP BY served_entity_id
+  ) u
+  JOIN entity_versions ev ON ev.served_entity_id = u.served_entity_id
+  GROUP BY 1, 2
+),
+-- Per-day billed-vs-requests series for the evidence chart.
+daily AS (
+  SELECT
+    workspace_id,
+    endpoint_id,
+    ARRAY_SORT(COLLECT_LIST(STRUCT(CAST(d AS STRING) AS d, w, r))) AS days_series
+  FROM (
+    SELECT
+      c.workspace_id,
+      c.usage_metadata.endpoint_id AS endpoint_id,
+      c.usage_date AS d,
+      1 AS w,                                     -- billed that day
+      0 AS r
+    FROM {{ tbl('billing','usage') }} c
+    WHERE {{ m.window_lower('c.usage_date') }}
+      AND c.billing_origin_product = 'MODEL_SERVING'
+      AND c.usage_metadata.endpoint_id IS NOT NULL
+    GROUP BY 1, 2, 3
+    UNION ALL
+    SELECT
+      ev.workspace_id,
+      ev.endpoint_id,
+      CAST(u.request_time AS DATE) AS d,
+      0 AS w,
+      COUNT(*) AS r                               -- requests that day
+    FROM {{ tbl('serving','endpoint_usage') }} u
+    JOIN entity_versions ev ON ev.served_entity_id = u.served_entity_id
+    WHERE {{ m.window_lower('u.request_time') }}
+    GROUP BY 1, 2, 3
+  )
+  GROUP BY 1, 2
+)
+SELECT
+  e.workspace_id,
+  e.endpoint_id,
+  e.endpoint_name,
+  e.entity_type,
+  e.entity_name,
+  e.created_by,
+  e.min_concurrency,
+  e.compute_type,
+  COALESCE(c.cost_window_usd, 0) AS cost_window_usd,
+  COALESCE(c.dbus_window, 0) AS dbus_window,
+  COALESCE(c.unpriced_window, 0) AS unpriced_window,{{ m.contract_cost_select('c') }}
+  COALESCE(c.days_billed, 0) AS days_billed,
+  COALESCE(c.is_provisioned_throughput, 0) AS is_provisioned_throughput,
+  COALESCE(c.is_batch_inference, 0) AS is_batch_inference,
+  COALESCE(r.requests_window, 0) AS requests_window,
+  COALESCE(r.ok_requests, 0) AS ok_requests,
+  COALESCE(r.distinct_requesters, 0) AS distinct_requesters,
+  r.last_request_time,
+  COALESCE(rt.requests_retained, 0) AS requests_retained,
+  rt.last_request_retained,
+  -- The history guard's sample size. For this rule the resource is only
+  -- "observed" on the days it actually BILLED: an endpoint created two days ago
+  -- has two days of evidence, and extrapolating a month of waste from that is
+  -- exactly the noise finops_rules.history exists to suppress.
+  COALESCE(c.days_billed, 0) AS observed_days,
+  -- Proof the entity dimension matched, so score() can distinguish
+  -- "measured zero requests" from "no request data joined" (see header).
+  1 AS entity_matched,
+  COALESCE(d.days_series, ARRAY()) AS days_series
+FROM endpoints e
+-- INNER JOIN: an endpoint with no priced usage in the window has nothing to save.
+JOIN cost c
+  ON c.workspace_id = e.workspace_id AND c.endpoint_id = e.endpoint_id
+LEFT JOIN requests r
+  ON r.workspace_id = e.workspace_id AND r.endpoint_id = e.endpoint_id
+LEFT JOIN retained rt
+  ON rt.workspace_id = e.workspace_id AND rt.endpoint_id = e.endpoint_id
+LEFT JOIN daily d
+  ON d.workspace_id = e.workspace_id AND d.endpoint_id = e.endpoint_id
+-- Only endpoints that bill while idle can have idle waste (see header).
+WHERE COALESCE(c.is_provisioned_throughput, 0) = 1
+   OR COALESCE(e.min_concurrency, 0) > 0

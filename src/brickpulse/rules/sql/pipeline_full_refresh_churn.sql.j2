@@ -1,0 +1,164 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: pipeline_full_refresh_churn  (Tier 1, B4 — frequent full refreshes)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate), priced PER UPDATE from
+--                    billing.usage.usage_metadata.dlt_update_id.
+--   units:           dollars per pipeline update; excess = full-refresh update cost
+--                    minus the SAME pipeline's median completed incremental update cost.
+--   counterfactual:  a full refresh recomputes every (selected) table from scratch; an
+--                    incremental update processes only new data. When a pipeline keeps
+--                    doing full refreshes (a flag left on in the scheduler, a checkpoint
+--                    or schema problem forcing a reset), each one costs far more than
+--                    the incremental update it could have been. Sum over full-refresh
+--                    updates of GREATEST(full_refresh_cost - median_incremental_cost, 0).
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      excess <= sum of full-refresh update cost; closed-open window;
+--                    corrections via the canonical price join; coverage-guarded.
+--
+-- How a full refresh appears (verified live 2026-09-23):
+--   * update_type = 'FULL_REFRESH' — the whole pipeline (API_CALL, USER_ACTION,
+--     JOB_TASK, RETRY_ON_FAILURE triggers all seen);
+--   * update_type = 'REFRESH' with a NON-EMPTY full_refresh_selection — a selective
+--     full refresh of the listed tables (rare, but real).
+--   An INCREMENTAL update is update_type = 'REFRESH' with an empty/NULL
+--   full_refresh_selection. VALIDATE updates (dry runs) are neither.
+--   The timeline is SLICED (several rows per long update), so everything is first
+--   collapsed to one row per update_id.
+-- Lakebase synced-table pipelines (pipeline_type = 'DATABASE_TABLE_SYNC') full-refresh
+-- on every SNAPSHOT sync BY DESIGN; score() skips them (the lever is the sync mode).
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH slices AS (
+  SELECT
+    workspace_id,
+    pipeline_id,
+    update_id,
+    update_type,
+    trigger_type,
+    result_state,
+    period_start_time,
+    period_end_time,
+    size(COALESCE(full_refresh_selection, array())) AS fr_tables,
+    trigger_details.job_task.job_id AS job_id
+  FROM {{ tbl('lakeflow','pipeline_update_timeline') }}
+  WHERE {{ m.window_lower('period_start_time') }}
+    AND update_type IN ('REFRESH', 'FULL_REFRESH')
+),
+upd AS (  -- one row per update
+  SELECT
+    workspace_id,
+    pipeline_id,
+    update_id,
+    MAX(CASE WHEN update_type = 'FULL_REFRESH' OR fr_tables > 0 THEN 1 ELSE 0 END) AS is_fr,
+    MAX(CASE WHEN update_type = 'REFRESH' AND fr_tables > 0 THEN 1 ELSE 0 END) AS is_selective,
+    MAX(trigger_type) AS trigger_type,
+    MAX(job_id) AS job_id,
+    -- the final slice carries the outcome; earlier slices are NULL
+    max_by(result_state, period_end_time) AS result_state,
+    CAST(MIN(period_start_time) AS DATE) AS day
+  FROM slices
+  GROUP BY 1, 2, 3
+),
+upd_cost AS (  -- real billed cost of each update (priced, coverage tracked)
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.dlt_update_id AS update_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_usd
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.dlt_update_id IS NOT NULL
+  GROUP BY 1, 2
+),
+upd_priced AS (
+  SELECT d.*, c.cost_usd
+  FROM upd d
+  LEFT JOIN upd_cost c USING (workspace_id, update_id)
+),
+baseline AS (  -- the pipeline's typical COMPLETED incremental update
+  SELECT
+    workspace_id,
+    pipeline_id,
+    COUNT(*) AS incremental_updates,
+    COUNT(cost_usd) AS incremental_priced,
+    percentile_approx(cost_usd, 0.5) AS median_incremental_cost_usd
+  FROM upd_priced
+  WHERE is_fr = 0 AND result_state = 'COMPLETED'
+  GROUP BY 1, 2
+),
+per_pl AS (
+  SELECT
+    p.workspace_id,
+    p.pipeline_id,
+    COUNT(*) AS updates,
+    COUNT(DISTINCT p.day) AS observed_days,
+    SUM(p.is_fr) AS full_refreshes,
+    SUM(CASE WHEN p.is_fr = 1 AND p.is_selective = 1 THEN 1 ELSE 0 END) AS selective_full_refreshes,
+    SUM(CASE WHEN p.is_fr = 1 AND p.trigger_type = 'JOB_TASK' THEN 1 ELSE 0 END) AS fr_job_task,
+    SUM(CASE WHEN p.is_fr = 1 AND p.trigger_type = 'API_CALL' THEN 1 ELSE 0 END) AS fr_api_call,
+    SUM(CASE WHEN p.is_fr = 1 AND p.trigger_type = 'USER_ACTION' THEN 1 ELSE 0 END) AS fr_user_action,
+    SUM(CASE WHEN p.is_fr = 1 AND p.trigger_type = 'RETRY_ON_FAILURE' THEN 1 ELSE 0 END) AS fr_retry,
+    COUNT(DISTINCT CASE WHEN p.is_fr = 1 THEN p.day END) AS fr_days,
+    MAX(CASE WHEN p.is_fr = 1 THEN p.job_id END) AS fr_job_id,
+    COUNT(CASE WHEN p.is_fr = 1 AND p.cost_usd IS NOT NULL THEN 1 END) AS fr_priced,
+    SUM(CASE WHEN p.is_fr = 1 THEN p.cost_usd END) AS full_refresh_cost_usd,
+    percentile_approx(CASE WHEN p.is_fr = 1 THEN p.cost_usd END, 0.5) AS median_full_refresh_cost_usd,
+    SUM(CASE WHEN p.is_fr = 1 AND b.median_incremental_cost_usd IS NOT NULL
+             THEN GREATEST(COALESCE(p.cost_usd, 0) - b.median_incremental_cost_usd, 0) END)
+      AS excess_cost_usd
+  FROM upd_priced p
+  LEFT JOIN baseline b USING (workspace_id, pipeline_id)
+  GROUP BY 1, 2
+  HAVING SUM(p.is_fr) >= {{ min_full_refreshes }}
+),
+-- Whole-pipeline cost for context + the coverage guard (unpriced usage share).
+cost AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.dlt_pipeline_id AS pipeline_id,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_30d_usd,
+    SUM(u.usage_quantity) AS dbus_30d,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    AND u.usage_metadata.dlt_pipeline_id IS NOT NULL
+  GROUP BY 1, 2
+),
+{{ m.latest_scd_cte(
+     'latest_pipelines',
+     tbl('lakeflow','pipelines'),
+     'workspace_id, pipeline_id',
+     select_cols='workspace_id, pipeline_id, name AS pipeline_name, pipeline_type, settings.continuous AS is_continuous, settings.development AS is_development, delete_time') }}
+SELECT
+  p.workspace_id,
+  p.pipeline_id,
+  COALESCE(pl.pipeline_name, p.pipeline_id) AS pipeline_name,
+  pl.pipeline_type,
+  pl.is_continuous,
+  pl.is_development,
+  p.updates,
+  p.observed_days,
+  p.full_refreshes,
+  p.selective_full_refreshes,
+  p.fr_job_task,
+  p.fr_api_call,
+  p.fr_user_action,
+  p.fr_retry,
+  p.fr_days,
+  p.fr_job_id,
+  p.fr_priced,
+  p.full_refresh_cost_usd,
+  p.median_full_refresh_cost_usd,
+  p.excess_cost_usd,
+  COALESCE(b.incremental_updates, 0) AS incremental_updates,
+  COALESCE(b.incremental_priced, 0) AS incremental_priced,
+  b.median_incremental_cost_usd,
+  COALESCE(c.cost_30d_usd, 0) AS cost_30d_usd,
+  COALESCE(c.dbus_30d, 0) AS dbus_30d,
+  COALESCE(c.unpriced_dbus, 0) AS unpriced_dbus
+FROM per_pl p
+LEFT JOIN baseline b USING (workspace_id, pipeline_id)
+LEFT JOIN cost c USING (workspace_id, pipeline_id)
+LEFT JOIN latest_pipelines pl USING (workspace_id, pipeline_id)

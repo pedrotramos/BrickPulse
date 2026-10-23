@@ -1,0 +1,92 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: instance_pool_idle  (instance pools, operational)
+--
+-- FORMULA HEADER
+--   cost basis:      NONE billable. An instance pool's warm (idle) instances are cloud
+--                    VMs billed by the cloud provider, NOT Databricks DBUs, so no
+--                    system.billing.usage row prices them. This is an OPERATIONAL
+--                    finding: $0 booked and $0 addressable in DBU terms.
+--   units:           warm instances (min_idle_instances) held 24/7; instance launches
+--                    and cluster acquisitions over the window (activity evidence).
+--   counterfactual:  min_idle_instances keeps that many VMs powered on at ALL times so
+--                    a cluster can grab one with no launch wait. If the pool does not
+--                    serve steady cluster demand, that warm floor is cloud VM spend for
+--                    nothing — lower min_idle_instances (or set an idle autotermination).
+--   savings_status:  advisory ($0 booked, operational). Experimental / Labs.
+--   invariants:      no dollars booked (advisory); no cost apportioned (there is none in
+--                    system tables); config read from the latest non-deleted pool SCD row.
+--
+-- DETECTION:
+--   * The warm floor comes from system.compute.instance_pools (latest non-deleted SCD
+--     row per pool): min_idle_instances > 0 means that many VMs stay powered on.
+--   * Activity comes from system.compute.instance_events over the window: how many
+--     instances the pool launched (INSTANCE_LAUNCHING) and how many were actually
+--     acquired by a cluster (cluster_id present) — low acquisitions against a high warm
+--     floor is the "warm but unused" signal. cluster_id is not always stamped on an
+--     event, so acquisitions are a LOWER bound and drive evidence, not suppression.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH ev AS (  -- pool instance events in the window
+  SELECT
+    workspace_id,
+    instance_pool_id,
+    instance_id,
+    CAST(event_time AS DATE) AS day,
+    event_type,
+    cluster_id
+  FROM {{ tbl('compute','instance_events') }}
+  WHERE instance_pool_id IS NOT NULL
+    AND {{ m.window_lower('event_time') }}
+),
+activity AS (
+  SELECT
+    workspace_id,
+    instance_pool_id,
+    COUNT(DISTINCT day) AS observed_days,
+    COUNT(DISTINCT CASE WHEN event_type = 'INSTANCE_LAUNCHING' THEN instance_id END)
+      AS launches,
+    COUNT(DISTINCT CASE WHEN cluster_id IS NOT NULL THEN instance_id END) AS acquisitions
+  FROM ev
+  GROUP BY 1, 2
+),
+-- Per-day launched vs acquired instances, for the chart (churn against the warm floor).
+daily AS (
+  SELECT workspace_id, instance_pool_id, day,
+         COUNT(DISTINCT CASE WHEN event_type = 'INSTANCE_LAUNCHING' THEN instance_id END) AS launched,
+         COUNT(DISTINCT CASE WHEN cluster_id IS NOT NULL THEN instance_id END) AS acquired
+  FROM ev
+  GROUP BY 1, 2, 3
+),
+daily_arr AS (
+  SELECT
+    workspace_id, instance_pool_id,
+    transform(
+      array_sort(collect_list(struct(day AS d, launched AS l, acquired AS a)),
+                 (x, y) -> CASE WHEN x.d < y.d THEN -1 WHEN x.d > y.d THEN 1 ELSE 0 END),
+      z -> named_struct('d', CAST(z.d AS STRING), 'l', z.l, 'a', z.a)
+    ) AS days
+  FROM daily
+  GROUP BY 1, 2
+),
+{{ m.latest_scd_cte(
+     'latest_pools',
+     tbl('compute','instance_pools'),
+     'workspace_id, instance_pool_id',
+     select_cols='workspace_id, instance_pool_id, instance_pool_name, node_type, min_idle_instances, idle_instance_autotermination_minutes, max_capacity, delete_time') }}
+SELECT
+  pl.workspace_id,
+  pl.instance_pool_id,
+  COALESCE(pl.instance_pool_name, pl.instance_pool_id) AS instance_pool_name,
+  pl.node_type,
+  pl.min_idle_instances,
+  pl.idle_instance_autotermination_minutes,
+  pl.max_capacity,
+  COALESCE(a.observed_days, 0) AS observed_days,
+  COALESCE(a.launches, 0) AS launches,
+  COALESCE(a.acquisitions, 0) AS acquisitions,
+  da.days
+FROM latest_pools pl
+LEFT JOIN activity a USING (workspace_id, instance_pool_id)
+LEFT JOIN daily_arr da USING (workspace_id, instance_pool_id)
+WHERE pl.delete_time IS NULL
+  AND pl.min_idle_instances >= {{ min_warm_instances }}

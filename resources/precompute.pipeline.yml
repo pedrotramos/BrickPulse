@@ -1,0 +1,24 @@
+resources:
+  pipelines:
+    precompute:
+      name: "[BrickPulse] Precompute (${var.catalog}.${var.schema})"
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      channel: CURRENT
+      continuous: false
+      libraries:
+        - file:
+            path: ../src/brickpulse/pipelines/pipeline.py
+      environment:
+        dependencies:
+          - ../dist/*.whl
+      configuration:
+        brickpulse.lookback_days: ${var.lookback_days}
+        brickpulse.pricing_mode: ${var.pricing_mode}
+        brickpulse.disabled_rules: ${var.disabled_rules}
+      # The pipeline's own event log, as a table: the app's run-status strip reads it.
+      event_log:
+        catalog: ${var.catalog}
+        schema: ${var.schema}
+        name: finops_run_log

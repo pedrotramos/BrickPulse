@@ -1,0 +1,205 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: unviewed_scheduled_dashboards  (Tier 2, C4 — dashboards refreshed for nobody)
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate on the warehouse's usage)
+--   units:           warehouse-hours; dollars = per billed warehouse-HOUR the dashboard
+--                    queried in, its share of that hour's total_task_duration_ms (query
+--                    count when the hour's queries were all cache hits) x the hour's
+--                    billed cost, summed over the unviewed window. Hours it didn't
+--                    query in are never charged to it, so a dashboard that refreshes
+--                    once a day on a busy warehouse isn't handed the warehouse's idle.
+--   counterfactual:  an AI/BI dashboard that keeps running its queries on a schedule
+--                    (or from an automated caller) while NOBODY opens it bills
+--                    warehouse time for results no one reads. Pausing the schedule or
+--                    removing the dashboard reclaims that share.
+--   savings_status:  advisory ($0 booked). Experimental / Labs.
+--   invariants:      per-hour share in [0, 1], so cost <= the billed cost of the hours it
+--                    ran in; closed-open
+--                    windows; coverage-guarded.
+--
+-- HOW VIEWS APPEAR (verified live 2026-09-23, 14 days):
+--   * access.audit service_name='dashboards' keys EVERY event on
+--     request_params['dashboard_id'] (no 'dashboardId' variant exists — 0 rows).
+--   * Opening a dashboard logs getDashboard / getPublishedDashboard /
+--     getDashboardDetails (embedded: getPublishedDashboardEmbedded /
+--     getPublishedDashboardTokenInfo).
+--   * The dashboard's queries log executeQuery. Scheduled / background refreshes carry
+--     user_agent 'lakeview-processing_<build>'; a browser (incl. embedded) or any
+--     other caller carries its own agent. So a non-'lakeview-processing' executeQuery
+--     is ALSO a view (someone changed a filter), and a lakeview-processing one is not.
+--   * query.history.query_source.dashboard_id is the same id (AI/BI dashboards only;
+--     legacy dashboards use legacy_dashboard_id and are out of scope).
+--
+-- SIGNAL-PRESENCE: a dashboard is only judged when the audit log saw it at all
+-- (audit_events > 0 over the lookback). Query activity with ZERO audit events means
+-- the audit stream doesn't cover it, and "no views" would be "can't see views".
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH dash_audit_day AS (  -- per dashboard and day: human/embedded views vs automated refreshes
+  SELECT
+    workspace_id,
+    request_params['dashboard_id'] AS dashboard_id,
+    event_date,
+    COUNT(*) AS audit_events,
+    SUM(CASE WHEN (action_name IN ('getDashboard', 'getPublishedDashboard',
+                            'getDashboardDetails', 'getPublishedDashboardEmbedded',
+                            'getPublishedDashboardTokenInfo')
+            OR (action_name = 'executeQuery'
+                AND COALESCE(user_agent, '') NOT LIKE 'lakeview-processing%'))
+             THEN 1 ELSE 0 END) AS view_events,
+    MAX(CASE WHEN (action_name IN ('getDashboard', 'getPublishedDashboard',
+                            'getDashboardDetails', 'getPublishedDashboardEmbedded',
+                            'getPublishedDashboardTokenInfo')
+            OR (action_name = 'executeQuery'
+                AND COALESCE(user_agent, '') NOT LIKE 'lakeview-processing%'))
+             THEN event_time END) AS last_view_time,
+    SUM(CASE WHEN action_name = 'executeQuery'
+              AND COALESCE(user_agent, '') LIKE 'lakeview-processing%'
+             THEN 1 ELSE 0 END) AS automated_events,
+    MAX(CASE WHEN action_name IN ('trashDashboard', 'deleteDashboard') THEN 1 ELSE 0 END)
+      AS was_deleted
+  FROM {{ tbl('access','audit') }}
+  WHERE {{ m.window_lower('event_date') }}
+    AND service_name = 'dashboards'
+    AND request_params['dashboard_id'] IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+dash_audit AS (  -- per dashboard over the lookback
+  SELECT
+    workspace_id,
+    dashboard_id,
+    SUM(audit_events) AS audit_events,
+    SUM(view_events) AS view_events,
+    MAX(last_view_time) AS last_view_time,
+    -- views inside the UNVIEWED window (must be 0 for a finding)
+    SUM(CASE WHEN {{ m.window_lower('event_date', unviewed_days) }}
+             THEN view_events ELSE 0 END) AS recent_view_events,
+    SUM(automated_events) AS automated_events,
+    MAX(was_deleted) AS was_deleted,
+    -- per-day scheduled refreshes (r) vs views (v), for the chart
+    transform(
+      array_sort(collect_list(struct(event_date AS d, automated_events AS r,
+                                     view_events AS v)),
+                 (l, r) -> CASE WHEN l.d < r.d THEN -1 WHEN l.d > r.d THEN 1 ELSE 0 END),
+      x -> named_struct('d', CAST(x.d AS STRING), 'r', x.r, 'v', x.v)
+    ) AS days
+  FROM dash_audit_day
+  GROUP BY 1, 2
+),
+dash_q AS (  -- dashboard queries in the UNVIEWED window, per warehouse-hour
+  SELECT
+    workspace_id,
+    query_source.dashboard_id AS dashboard_id,
+    compute.warehouse_id AS warehouse_id,
+    date_trunc('hour', start_time) AS hr,
+    COUNT(*) AS queries,
+    SUM(COALESCE(total_task_duration_ms, 0)) AS task_ms,
+    MIN(start_time) AS first_query,
+    MAX(start_time) AS last_query,
+    max_by(executed_by, start_time) AS executed_by
+  FROM {{ tbl('query','history') }}
+  WHERE {{ m.window_lower('start_time', unviewed_days) }}
+    AND query_source.dashboard_id IS NOT NULL
+    AND compute.warehouse_id IS NOT NULL
+  GROUP BY 1, 2, 3, 4
+),
+wh_q AS (  -- every query on those warehouses, same window and hour
+  SELECT
+    workspace_id,
+    compute.warehouse_id AS warehouse_id,
+    date_trunc('hour', start_time) AS hr,
+    COUNT(*) AS wh_queries,
+    SUM(COALESCE(total_task_duration_ms, 0)) AS wh_task_ms
+  FROM {{ tbl('query','history') }}
+  WHERE {{ m.window_lower('start_time', unviewed_days) }}
+    AND compute.warehouse_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+wh_cost AS (  -- real billed warehouse cost per hour, priced via list_prices
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.warehouse_id AS warehouse_id,
+    date_trunc('hour', u.usage_start_time) AS hr,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced_dbus
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date', unviewed_days) }}
+    AND u.usage_metadata.warehouse_id IS NOT NULL
+  GROUP BY 1, 2, 3
+),
+dash_wh AS (  -- the dashboard's share of each billed warehouse-HOUR it ran in
+  SELECT
+    dq.*,
+    -- Share of that hour's work: by task time, or by query count when the hour's
+    -- queries were all result-cache hits (0 task ms) yet still kept it running.
+    CASE WHEN COALESCE(wq.wh_task_ms, 0) > 0
+         THEN LEAST(1.0, GREATEST(0.0, dq.task_ms / wq.wh_task_ms))
+         WHEN COALESCE(wq.wh_queries, 0) > 0
+         THEN LEAST(1.0, dq.queries / wq.wh_queries)
+         ELSE 0.0 END AS hour_share,
+    COALESCE(wq.wh_task_ms, 0) AS wh_task_ms,
+    COALESCE(wc.usd, 0.0) AS wh_usd,
+    COALESCE(wc.dbus, 0.0) AS wh_dbus,
+    COALESCE(wc.unpriced_dbus, 0.0) AS wh_unpriced_dbus
+  FROM dash_q dq
+  LEFT JOIN wh_q wq USING (workspace_id, warehouse_id, hr)
+  LEFT JOIN wh_cost wc USING (workspace_id, warehouse_id, hr)
+),
+per_dash AS (
+  SELECT
+    workspace_id,
+    dashboard_id,
+    SUM(queries) AS queries,
+    SUM(task_ms) AS task_ms,
+    -- distinct days it refreshed: the sample the monthly figure extrapolates
+    COUNT(DISTINCT CAST(hr AS DATE)) AS observed_days,
+    COUNT(DISTINCT hr) AS active_hours,
+    MIN(first_query) AS first_query,
+    MAX(last_query) AS last_query,
+    max_by(warehouse_id, task_ms) AS warehouse_id,
+    max_by(executed_by, queries) AS executed_by,
+    COUNT(DISTINCT warehouse_id) AS warehouses,
+    SUM(hour_share * wh_usd) AS unviewed_cost_window,
+    -- hours it ran in, and what the warehouse billed in them (the allocation's base)
+    SUM(wh_usd) AS active_hours_cost_window,
+    SUM(CASE WHEN hour_share >= 0.99 THEN 1 ELSE 0 END) AS sole_user_hours,
+    SUM(hour_share * wh_dbus) AS dbus_window,
+    -- the dashboard's share of its warehouse-hours' unpriced DBUs (coverage guard)
+    SUM(hour_share * wh_unpriced_dbus) AS unpriced_dbus
+  FROM dash_wh
+  GROUP BY 1, 2
+)
+SELECT
+  pd.workspace_id,
+  pd.dashboard_id,
+  pd.warehouse_id,
+  pd.warehouses,
+  pd.executed_by,
+  pd.queries,
+  ROUND(pd.task_ms / 3600000.0, 3) AS task_hours,
+  pd.observed_days,
+  pd.active_hours,
+  pd.first_query,
+  pd.last_query,
+  ROUND(pd.unviewed_cost_window, 4) AS unviewed_cost_window,
+  ROUND(pd.active_hours_cost_window, 4) AS active_hours_cost_window,
+  pd.sole_user_hours,
+  pd.dbus_window AS dbus_30d,
+  pd.unpriced_dbus,
+  {{ unviewed_days }} AS unviewed_window_days,
+  COALESCE(da.audit_events, 0) AS audit_events,
+  COALESCE(da.view_events, 0) AS view_events,
+  da.last_view_time,
+  COALESCE(da.recent_view_events, 0) AS recent_view_events,
+  COALESCE(da.automated_events, 0) AS automated_events,
+  COALESCE(da.was_deleted, 0) AS was_deleted,
+  da.days
+FROM per_dash pd
+LEFT JOIN dash_audit da
+  ON da.workspace_id = pd.workspace_id AND da.dashboard_id = pd.dashboard_id
+-- No view inside the unviewed window (or no view at all in the lookback).
+WHERE COALESCE(da.recent_view_events, 0) = 0
+  AND pd.task_ms > 0
