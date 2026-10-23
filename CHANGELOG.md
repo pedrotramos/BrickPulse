@@ -7,6 +7,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the frontend (Playwright, Prettier, TanStack Query, Radix UI, JetBrains Mono) and Python runtime
+  dependencies (FastAPI, Uvicorn, Pydantic, Databricks SDK and SQL connector, python-dotenv, ruff).
+- CI tests the pinned runtime versions in `requirements.txt`.
+
+### Removed
+
+- Dependabot version updates.
+
 ## [0.1.0] - 2026-10-23
 
 ### Added
