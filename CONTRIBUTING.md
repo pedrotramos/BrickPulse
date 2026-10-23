@@ -58,6 +58,9 @@ Write commit messages in the imperative ("Add warehouse idle rule", "Fix spend t
   "no findings".
 - **Frontend build output is committed.** The deployed app serves `src/brickpulse/server/static` from the
   synced sources. When you change `frontend/`, run `npm run build` and commit the result.
+  Dependabot can't build, so on its frontend PRs the *Rebuild frontend for Dependabot* workflow commits
+  the rebuilt UI to the branch. Because of that commit, Dependabot no longer rebases those PRs by itself;
+  comment `@dependabot recreate` when one falls behind `main`.
 - **Python style.** Run `ruff check` (line length 110, Python 3.10 target) and match the style of the
   surrounding code.
 

@@ -12,6 +12,9 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # Vite and its React plugin only work at matching majors, so they move together.
+      vite:
+        patterns: ["vite", "@vitejs/*"]
       frontend:
         patterns: ["*"]
         update-types: [minor, patch]
@@ -19,3 +22,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
