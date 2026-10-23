@@ -42,7 +42,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "httpx>=0.28", "build>=1", "ruff==0.15.17"]
+dev = ["pytest>=8", "httpx>=0.28", "build>=1", "ruff==0.17.1"]
 
 [project.urls]
 Homepage = "https://github.com/pedrotramos/BrickPulse"
