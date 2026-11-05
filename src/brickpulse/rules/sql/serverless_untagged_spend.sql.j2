@@ -1,0 +1,131 @@
+{% import '_macros.sql.j2' as m with context %}
+-- Rule: serverless_untagged_spend
+-- Serverless resources whose billed spend carries none of the required ownership
+-- tags, so the money cannot be charged back to a team, project or cost centre.
+--
+-- WHAT THIS ADDS TO untagged_spend
+--   untagged_spend covers usage that carries a cluster, warehouse or job id. It
+--   excluded everything else on purpose, because that spend had no resource type
+--   the app could name. This rule covers exactly that remainder for the five
+--   serverless products whose usage rows DO name a resource:
+--     APPS           usage_metadata.app_id           -> app
+--     DLT            usage_metadata.dlt_pipeline_id  -> pipeline (serverless only:
+--                    classic pipelines carry a cluster_id and stay in untagged_spend)
+--     LAKEBASE       usage_metadata.endpoint_id      -> lakebase_endpoint
+--     VECTOR_SEARCH  usage_metadata.endpoint_name    -> vector_search_endpoint
+--     MODEL_SERVING  usage_metadata.endpoint_name    -> serving_endpoint (the name
+--                    keeps the frontend's /ml/endpoints/<name> deep link working)
+--   The universe is the rows with NO cluster_id, warehouse_id or job_id, so the two
+--   rules can never report the same dollar. Lakebase storage rows carry no
+--   endpoint id and are left out.
+--
+-- WHY NOT "MISSING USAGE POLICY"
+--   Verified live (2026-11-04): ~98% of serverless usage already carries custom
+--   tags while only ~4-13% carries a usage policy id, so a missing policy is not
+--   by itself an attribution gap. The measurable gap is the required tags, e.g.
+--   only 142 of 19,111 apps carried a cost-centre tag.
+--
+-- TAG MATCHING is the same as untagged_spend (case-insensitive aliases from
+-- config/thresholds.yaml, blank values count as absent).
+--
+-- IMPORTANT: no workspace_id filter here. Persona scoping is injected by the data
+-- layer so this same SQL serves account-wide precompute and workspace-scoped live
+-- queries.
+WITH usage_rows AS (
+  SELECT
+    u.workspace_id,
+    CASE u.billing_origin_product
+      WHEN 'APPS' THEN u.usage_metadata.app_id
+      WHEN 'DLT' THEN u.usage_metadata.dlt_pipeline_id
+      WHEN 'LAKEBASE' THEN u.usage_metadata.endpoint_id
+      WHEN 'VECTOR_SEARCH' THEN u.usage_metadata.endpoint_name
+      WHEN 'MODEL_SERVING' THEN u.usage_metadata.endpoint_name
+    END AS resource_id,
+    CASE u.billing_origin_product
+      WHEN 'APPS' THEN 'app'
+      WHEN 'DLT' THEN 'pipeline'
+      WHEN 'LAKEBASE' THEN 'lakebase_endpoint'
+      WHEN 'VECTOR_SEARCH' THEN 'vector_search_endpoint'
+      WHEN 'MODEL_SERVING' THEN 'serving_endpoint'
+    END AS resource_type,
+    u.billing_origin_product AS product,
+    u.usage_metadata.app_name AS app_name,
+    u.custom_tags,
+    u.usage_date,
+    u.usage_quantity,
+    {{ m.price_rate('lp') }} AS rate,
+    {{ m.unpriced_dbus() }} AS unpriced_qty,
+    COALESCE(u.identity_metadata.owned_by, u.identity_metadata.run_as,
+             u.identity_metadata.created_by) AS identity_hint
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date') }}
+    -- keep ALL record_types: a RETRACTION cancels the superseded ORIGINAL (same
+    -- reasoning as untagged_spend).
+    AND u.billing_origin_product IN ('APPS', 'DLT', 'LAKEBASE', 'VECTOR_SEARCH', 'MODEL_SERVING')
+    -- Disjoint from untagged_spend by construction.
+    AND u.usage_metadata.cluster_id IS NULL
+    AND u.usage_metadata.warehouse_id IS NULL
+    AND u.usage_metadata.job_id IS NULL
+    -- Databricks-hosted Foundation Model endpoints (databricks-claude-*, ...) are
+    -- shared system endpoints the customer cannot tag. Verified live: 66 names
+    -- across 4,090 endpoint ids, and 0% of their usage carries a usage policy.
+    AND NOT (u.billing_origin_product = 'MODEL_SERVING'
+             AND COALESCE(u.usage_metadata.endpoint_name, '') LIKE 'databricks-%')
+),
+named AS (
+  SELECT * FROM usage_rows WHERE resource_id IS NOT NULL
+),
+tagged AS (
+  SELECT
+    *,
+{%- for tag, aliases in required_tags.items() %}
+    size(map_filter(custom_tags, (k, v) ->
+      lower(k) IN ({% for a in aliases %}'{{ a | lower }}'{{ ", " if not loop.last }}{% endfor %})
+      AND v IS NOT NULL AND trim(v) <> ''
+    )) > 0 AS has_{{ tag }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+  FROM named
+),
+per_resource AS (
+  SELECT
+    workspace_id,
+    resource_id,
+    resource_type,
+    MAX(product) AS product,
+    MAX(app_name) AS app_name,
+    ROUND(SUM(usage_quantity * rate), 6) AS cost_30d_usd,
+    SUM(usage_quantity) AS dbus_30d,
+    SUM(unpriced_qty) AS unpriced_dbus,
+    -- Spend is the only evidence, so billed days ARE the observation window.
+    COUNT(DISTINCT usage_date) AS observed_days,
+    MAX(identity_hint) AS identity_hint,
+    -- Present for the resource if ANY of its usage rows carry it (same generous
+    -- rule as untagged_spend: a resource retagged mid-window is tagged now).
+{%- for tag in required_tags %}
+    MAX(CASE WHEN has_{{ tag }} THEN 1 ELSE 0 END) = 1 AS has_{{ tag }}{{ "," if not loop.last else "" }}
+{%- endfor %}
+  FROM tagged
+  GROUP BY workspace_id, resource_id, resource_type
+)
+SELECT
+  workspace_id,
+  resource_id,
+  resource_type,
+  product,
+  app_name,
+  cost_30d_usd,
+  dbus_30d,
+  unpriced_dbus,
+  observed_days,
+  identity_hint,
+  -- Missing tag NAMES as an array of strings (see untagged_spend for why not
+  -- booleans: the REST reader returns 'false' as a truthy string).
+  array_compact(array(
+{%- for tag in required_tags %}
+    CASE WHEN has_{{ tag }} THEN NULL ELSE '{{ tag }}' END{{ "," if not loop.last else "" }}
+{%- endfor %}
+  )) AS missing_tags,
+  {{ required_tags | length }} AS required_tag_count
+FROM per_resource
+WHERE cost_30d_usd > 0

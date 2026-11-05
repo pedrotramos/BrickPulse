@@ -1,0 +1,192 @@
+{% import '_macros.sql.j2' as m with context %}
+{#- Lakebase telemetry keeps 7 days, so the window is the shorter of the two. -#}
+{% set w = [lookback_days, telemetry_days] | min %}
+-- Rule: lakebase_scale_to_zero
+--
+-- FORMULA HEADER
+--   cost basis:      dbx_list (effective_list DBU rate) on the endpoint's
+--                    ALWAYS-ON floor usage, priced per 10-minute billing slot.
+--   units:           billed floor hours (billing.usage, 10-minute slots grouped
+--                    to the hour) x client backends per hour
+--                    (system.lakebase.database_gauges.numbackends, 30 s samples).
+--   counterfactual:  with scale-to-zero on, an endpoint with no client
+--                    connection suspends after its timeout and bills nothing
+--                    until the next connection. Only idle RUNS of at least
+--                    {{ min_idle_run_hours }} consecutive billed hours count, and
+--                    each run gives back {{ suspend_timeout_minutes }} minutes
+--                    (the timeout the endpoint would still bill before
+--                    suspending).
+--   savings_status:  estimated (Labs). Idle hours and their cost are measured;
+--                    the cold start on the next connection is the trade-off.
+--   invariants:      reclaimable_cost_usd <= cost_window_usd (a subset of the
+--                    same priced slots); closed-open window; coverage-guarded.
+--
+-- WHY THESE SIGNALS (verified live 2026-11-04)
+--   * product_features.lakebase.compute_type = 'COMPUTE_NODE_ALWAYS_ON_MIN' is
+--     the always-on floor. Endpoints billing it filled ~990 of 1,008 ten-minute
+--     slots in 7 days; endpoints billing only 'COMPUTE_NODE' filled a median of
+--     13 (they suspend). So this compute_type is measured "scale-to-zero is off
+--     (or its timeout is longer than the window)", not an inference.
+--   * numbackends counts client backends and reads 0 on an idle database.
+--     sessions_established is NOT used: the platform opens internal sessions
+--     every ~2 hours, so it is never 0 on an idle endpoint.
+--   * An hour without telemetry is UNKNOWN, never idle: the telemetry tables are
+--     Beta, opt-in (Previews > "Lakebase Observability in System Tables") and
+--     keep 7 days.
+--   * Memory reads ~2 GiB per CU (0.5 CU = 0.08 DBU/h ~ 1 GiB; 4 CU = 0.639
+--     DBU/h ~ 7.7 GiB; 112 CU = 17.9 DBU/h ~ 215 GiB). floor_cu feeds only the
+--     "scale-to-zero needs max <= 32 CU" guard; it never prices anything.
+--
+-- IMPORTANT: no workspace_id filter here (persona scoping injected downstream).
+WITH
+-- The priced always-on floor per endpoint per hour.
+floor_hours AS (
+  SELECT
+    u.workspace_id,
+    u.usage_metadata.endpoint_id AS endpoint_id,
+    MAX(u.usage_metadata.project_id) AS project_id,
+    MAX(u.usage_metadata.branch_id) AS branch_id,
+    date_trunc('HOUR', u.usage_start_time) AS h,
+    SUM(u.usage_quantity * {{ m.price_rate('lp') }}) AS cost_usd,
+    SUM(u.usage_quantity) AS dbus,
+    SUM({{ m.unpriced_dbus() }}) AS unpriced
+  FROM {{ tbl('billing','usage') }} u
+  {{ m.price_join('lp') }}
+  WHERE {{ m.window_lower('u.usage_date', days=w) }}
+    AND u.billing_origin_product = 'LAKEBASE'
+    AND u.product_features.lakebase.compute_type = 'COMPUTE_NODE_ALWAYS_ON_MIN'
+    AND u.usage_metadata.endpoint_id IS NOT NULL
+  GROUP BY u.workspace_id, u.usage_metadata.endpoint_id, date_trunc('HOUR', u.usage_start_time)
+),
+-- Client backends per endpoint per hour, across every database on the endpoint.
+gauge_hours AS (
+  SELECT
+    g.endpoint_id,
+    date_trunc('HOUR', g.ts) AS h,
+    MAX(g.numbackends) AS max_backends,
+    COUNT(DISTINCT g.ts) AS samples
+  FROM {{ tbl('lakebase','database_gauges') }} g
+  WHERE {{ m.window_lower('g.ts', days=w) }}
+  GROUP BY g.endpoint_id, date_trunc('HOUR', g.ts)
+),
+-- Names, role and memory of the endpoint's computes.
+compute_dim AS (
+  SELECT
+    c.endpoint_id,
+    MAX(NULLIF(c.project_name, '')) AS project_name,
+    MAX(NULLIF(c.branch_name, '')) AS branch_name,
+    MAX(NULLIF(c.endpoint_name, '')) AS endpoint_name,
+    MAX(c.compute_mode) AS compute_mode,
+    MIN(c.host_memory_total_bytes) AS min_memory_bytes,
+    MAX(c.host_memory_total_bytes) AS max_memory_bytes
+  FROM {{ tbl('lakebase','compute_gauges') }} c
+  WHERE {{ m.window_lower('c.ts', days=w) }}
+  GROUP BY c.endpoint_id
+),
+-- One row per billed floor hour. idle = telemetry covered the hour AND no client
+-- backend was seen in it. telemetry = the hour has enough samples to judge.
+grid AS (
+  SELECT
+    f.workspace_id, f.endpoint_id, f.project_id, f.branch_id, f.h,
+    f.cost_usd, f.dbus, f.unpriced,
+    CASE WHEN COALESCE(g.samples, 0) >= {{ min_samples_per_hour }} THEN 1 ELSE 0 END AS telemetry,
+    CASE WHEN COALESCE(g.samples, 0) >= {{ min_samples_per_hour }} AND g.max_backends = 0
+         THEN 1 ELSE 0 END AS idle,
+    CASE WHEN COALESCE(g.samples, 0) >= {{ min_samples_per_hour }} AND g.max_backends > 0
+         THEN 1 ELSE 0 END AS client
+  FROM floor_hours f
+  LEFT JOIN gauge_hours g
+    ON g.endpoint_id = f.endpoint_id AND g.h = f.h
+),
+-- Gaps-and-islands over idle billed hours (same shape as
+-- serving_provisioned_overcapacity): consecutive idle hours share a run key; a
+-- billing gap or a client hour breaks the run.
+idle_runs AS (
+  SELECT workspace_id, endpoint_id, run_key,
+         COUNT(*) AS run_hours, SUM(cost_usd) AS run_cost_usd
+  FROM (
+    SELECT workspace_id, endpoint_id, cost_usd,
+           CAST(unix_timestamp(h) / 3600 AS BIGINT)
+             - ROW_NUMBER() OVER (PARTITION BY workspace_id, endpoint_id ORDER BY h) AS run_key
+    FROM grid
+    WHERE idle = 1
+  )
+  GROUP BY workspace_id, endpoint_id, run_key
+),
+runs AS (
+  SELECT
+    workspace_id, endpoint_id,
+    SUM(CASE WHEN run_hours >= {{ min_idle_run_hours }} THEN run_hours ELSE 0 END)
+      AS reclaimable_idle_hours,
+    -- Each run still bills the suspend timeout before the endpoint stops.
+    SUM(CASE WHEN run_hours >= {{ min_idle_run_hours }}
+             THEN run_cost_usd * GREATEST(0.0, 1.0 - {{ suspend_timeout_minutes }} / (60.0 * run_hours))
+             ELSE 0 END) AS reclaimable_cost_usd,
+    MAX(run_hours) AS longest_idle_run_hours
+  FROM idle_runs
+  GROUP BY workspace_id, endpoint_id
+),
+per_ep AS (
+  SELECT
+    workspace_id, endpoint_id,
+    MAX(project_id) AS project_id,
+    MAX(branch_id) AS branch_id,
+    COUNT(*) AS billed_hours,
+    SUM(telemetry) AS telemetry_hours,
+    SUM(idle) AS idle_hours,
+    SUM(client) AS client_hours,
+    COUNT(DISTINCT CASE WHEN telemetry = 1 THEN CAST(h AS DATE) END) AS observed_days,
+    SUM(cost_usd) AS cost_window_usd,
+    SUM(dbus) AS dbus_30d,
+    SUM(unpriced) AS unpriced_dbus,
+    SUM(dbus) / COUNT(*) AS floor_dbu_per_hour
+  FROM grid
+  GROUP BY workspace_id, endpoint_id
+),
+-- Per-day billed floor hours vs hours with a client connected, for the evidence.
+daily AS (
+  SELECT
+    workspace_id, endpoint_id,
+    ARRAY_SORT(COLLECT_LIST(STRUCT(CAST(d AS STRING) AS d, billed_hours, client_hours))) AS daily_activity
+  FROM (
+    SELECT workspace_id, endpoint_id, CAST(h AS DATE) AS d,
+           COUNT(*) AS billed_hours, SUM(client) AS client_hours
+    FROM grid
+    GROUP BY workspace_id, endpoint_id, CAST(h AS DATE)
+  )
+  GROUP BY workspace_id, endpoint_id
+)
+SELECT
+  p.workspace_id,
+  p.endpoint_id,
+  p.project_id,
+  p.branch_id,
+  c.project_name,
+  c.branch_name,
+  c.endpoint_name,
+  c.compute_mode,
+  -- ~2 GiB per CU, rounded to the 0.5 CU autoscaling step. Guard input only.
+  ROUND(c.min_memory_bytes / ({{ gib_per_cu }} * 1073741824.0) * 2) / 2 AS floor_cu,
+  ROUND(c.max_memory_bytes / ({{ gib_per_cu }} * 1073741824.0) * 2) / 2 AS peak_cu,
+  p.floor_dbu_per_hour,
+  p.billed_hours,
+  p.telemetry_hours,
+  p.idle_hours,
+  p.client_hours,
+  p.observed_days,
+  p.cost_window_usd,
+  p.dbus_30d,
+  p.unpriced_dbus,
+  COALESCE(r.reclaimable_idle_hours, 0) AS reclaimable_idle_hours,
+  COALESCE(r.reclaimable_cost_usd, 0) AS reclaimable_cost_usd,
+  COALESCE(r.longest_idle_run_hours, 0) AS longest_idle_run_hours,
+  {{ w }} AS window_days,
+  COALESCE(d.daily_activity, ARRAY()) AS daily_activity
+FROM per_ep p
+-- INNER: an endpoint with no compute telemetry at all has no idleness signal.
+JOIN compute_dim c
+  ON c.endpoint_id = p.endpoint_id
+LEFT JOIN runs r
+  ON r.workspace_id = p.workspace_id AND r.endpoint_id = p.endpoint_id
+LEFT JOIN daily d
+  ON d.workspace_id = p.workspace_id AND d.endpoint_id = p.endpoint_id

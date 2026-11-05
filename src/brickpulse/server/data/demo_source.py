@@ -202,6 +202,18 @@ _RULE_PROFILE: dict[str, dict] = {
     # attributed to, never the bill. save_frac is 0 so demo mode honours the same
     # invariant the live rule does — otherwise the demo's savings headline would
     # include money that cannot be banked. `waste` is the unattributable spend.
+    # Labs coverage rules scored by their real score() (demo_rule_rows). The profile
+    # only sets how many findings appear; the numbers and copy come from the rule.
+    "lakebase_scale_to_zero": {
+        "effort": "low", "priority": "HIGH", "noun": "lakebase_endpoint",
+        "waste": (15, 500), "save_frac": (0.5, 1.0), "n": 6,
+        "how": "Enable scale-to-zero on the endpoint, or delete the branch if unused.",
+    },
+    "serverless_untagged_spend": {
+        "effort": "trivial", "priority": "MEDIUM", "noun": "app",
+        "waste": (100, 4000), "save_frac": (0.0, 0.0), "n": 6,
+        "how": "Assign a serverless usage policy that carries the missing tags.",
+    },
     "untagged_spend": {
         "effort": "trivial", "priority": "MEDIUM", "noun": "cluster",
         "waste": (600, 9000), "save_frac": (0.0, 0.0), "n": 8,
@@ -297,6 +309,10 @@ _RULE_PROFILE: dict[str, dict] = {
     },
 }
 
+#: Rules added after the financial baseline was frozen. Each gets a private rng in
+#: ``_all`` so it cannot perturb the shared stream the frozen findings depend on.
+_ISOLATED_RNG_RULES = frozenset({"lakebase_scale_to_zero", "serverless_untagged_spend"})
+
 _DEFAULT_PROFILE = {
     "effort": "medium", "priority": "MEDIUM", "noun": "resource",
     "waste": (1000, 5000), "save_frac": (0.3, 0.6), "n": 5,
@@ -358,16 +374,24 @@ class DemoRecommendationSource(RecommendationSource):
         identity: dict[str, tuple[str, float, str, str]] = {}
 
         for rule in sorted(list_rules(), key=lambda r: r.id):
+            # Rules added after the frozen financial baseline draw from their OWN
+            # stream, so adding a rule never shifts the numbers of the rules sorted
+            # after it (tests/fixtures/financial_baseline.json stays comparable).
+            rule_rng = (
+                random.Random(f"20260706:{rule.id}")
+                if rule.id in _ISOLATED_RNG_RULES
+                else rng
+            )
             prof = _RULE_PROFILE.get(rule.id, _DEFAULT_PROFILE)
             # Spread this rule's findings across a rotating subset of workspaces.
-            picks = rng.sample(_WORKSPACES, min(prof["n"], len(_WORKSPACES)))
+            picks = rule_rng.sample(_WORKSPACES, min(prof["n"], len(_WORKSPACES)))
             for i, (wid, _wname) in enumerate(picks):
                 res_type = rule.resource_type or prof["noun"]
                 res_id = f"{res_type[:3]}-{wid[-4:]}-{i + 1:03d}"
-                fresh_name = f"{rng.choice(_NAME_BITS)}-{res_type}-{i + 1:02d}"
-                fresh_waste = round(rng.uniform(*prof["waste"]), 2)
-                fresh_owner = rng.choice(_OWNERS)
-                fresh_creator = rng.choice([fresh_owner, fresh_owner, rng.choice(_OWNERS)])
+                fresh_name = f"{rule_rng.choice(_NAME_BITS)}-{res_type}-{i + 1:02d}"
+                fresh_waste = round(rule_rng.uniform(*prof["waste"]), 2)
+                fresh_owner = rule_rng.choice(_OWNERS)
+                fresh_creator = rule_rng.choice([fresh_owner, fresh_owner, rule_rng.choice(_OWNERS)])
                 res_name, waste, owner, creator = identity.setdefault(
                     res_id, (fresh_name, fresh_waste, fresh_owner, fresh_creator)
                 )
@@ -378,11 +402,11 @@ class DemoRecommendationSource(RecommendationSource):
                 # Series-based rules derive savings from the generated usage
                 # series via the validated savings math (finops_rules.savings);
                 # others fall back to the profile's rough fraction.
-                computed, evidence = _evidence(rule.id, waste, rng)
+                computed, evidence = _evidence(rule.id, waste, rule_rng)
                 savings = (
                     computed
                     if computed is not None
-                    else round(waste * rng.uniform(*prof["save_frac"]), 2)
+                    else round(waste * rule_rng.uniform(*prof["save_frac"]), 2)
                 )
                 evidence["avoidable_usd"] = savings
                 # Optional savings BAND for the estimate-tier rules, so demo mode shows
