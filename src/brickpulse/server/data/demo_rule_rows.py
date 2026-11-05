@@ -239,6 +239,42 @@ def _smart_routing(rng: random.Random, k: float) -> dict:
     }
 
 
+def _lakebase(rng: random.Random, k: float) -> dict:
+    # A 4 CU always-on floor (0.639 DBU/h) observed for 7 days. Mostly idle: a
+    # client connects during a few business hours, otherwise nobody does.
+    window, rate = 7, 0.639 * 0.26
+    days, client_total = [], 0
+    for d in _days(window):
+        c = rng.choice([0, 0, 1, 2, 3])
+        client_total += c
+        days.append({"d": d, "billed_hours": 24, "client_hours": c})
+    billed = 24 * window
+    cost = billed * rate * k
+    idle = billed - client_total
+    return {
+        "endpoint_id": "ep", "project_id": "proj", "branch_id": "br",
+        "project_name": "orders-app", "branch_name": "dev", "endpoint_name": "primary",
+        "compute_mode": "primary", "floor_cu": 4.0, "peak_cu": 4.0,
+        "floor_dbu_per_hour": 0.639, "billed_hours": billed, "telemetry_hours": billed,
+        "idle_hours": idle, "client_hours": client_total, "observed_days": window,
+        "cost_window_usd": cost, "dbus_30d": billed * 0.639, "unpriced_dbus": 0.0,
+        "reclaimable_idle_hours": idle - window,
+        "reclaimable_cost_usd": cost * (idle - window) / billed * 0.97,
+        "longest_idle_run_hours": 18, "window_days": window, "daily_activity": days,
+    }
+
+
+def _serverless_tags(rng: random.Random, k: float) -> dict:
+    missing = rng.sample(["team", "project", "environment", "cost_center"], rng.randint(1, 4))
+    cost = round(rng.uniform(120, 1500) * k, 2)
+    return {
+        "resource_id": "app", "resource_type": "app", "product": "APPS",
+        "app_name": "sales-assistant", "cost_30d_usd": cost, "dbus_30d": cost / 0.07,
+        "unpriced_dbus": 0.0, "observed_days": 30, "identity_hint": "data-apps-team",
+        "missing_tags": sorted(missing), "required_tag_count": 5,
+    }
+
+
 # rule_id -> (generator, the key its SQL uses for the resource id)
 GENERATORS: dict[str, tuple[Callable[[random.Random, float], dict], str]] = {
     "warehouse_keepalive_queries": (_keepalive, "warehouse_id"),
@@ -250,6 +286,8 @@ GENERATORS: dict[str, tuple[Callable[[random.Random, float], dict], str]] = {
     "unpruned_repeated_queries": (_unpruned, "warehouse_id"),
     "unviewed_scheduled_dashboards": (_dashboards, "dashboard_id"),
     "coding_agent_smart_routing": (_smart_routing, "demo_resource_id"),  # one per workspace
+    "lakebase_scale_to_zero": (_lakebase, "endpoint_id"),
+    "serverless_untagged_spend": (_serverless_tags, "resource_id"),
 }
 
 
@@ -266,7 +304,7 @@ def scored_demo_finding(rule, *, workspace_id: str, resource_id: str, resource_n
     gen, id_key = spec
     row = gen(rng, rng.uniform(0.6, 2.5))
     row.update({"workspace_id": workspace_id, id_key: resource_id})
-    for name_key in ("warehouse_name", "job_name", "endpoint_name"):
+    for name_key in ("warehouse_name", "job_name", "endpoint_name", "app_name"):
         if name_key in row and name_key.split("_")[0] in rule.resource_type:
             row[name_key] = resource_name
     ctx = RuleContext(thresholds=thresholds.get(rule.id, {}), lookback_days=LOOKBACK,

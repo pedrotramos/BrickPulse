@@ -525,5 +525,9 @@ def _multi_action_label(resource_type: str, n: int) -> str:
         "job": "job",
         # Slug -> what an admin calls it; "serving_endpoint" would read as a typo.
         "serving_endpoint": "serving endpoint",
+        "pipeline": "pipeline",
+        "app": "app",
+        "lakebase_endpoint": "Lakebase endpoint",
+        "vector_search_endpoint": "vector search endpoint",
     }.get(resource_type, "resource")
     return f"{n} ways to optimize this {noun}"

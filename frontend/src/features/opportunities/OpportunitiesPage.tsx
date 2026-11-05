@@ -217,6 +217,8 @@ export default function OpportunitiesPage({
               "dashboard",
               "alert",
               "app",
+              "lakebase_endpoint",
+              "vector_search_endpoint",
               "workspace",
             ].map((v) => (
               <option key={v} value={v}>

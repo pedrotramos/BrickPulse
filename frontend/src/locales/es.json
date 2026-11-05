@@ -279,7 +279,9 @@
     "dashboard": "Dashboard",
     "alert": "Alerta",
     "workspace": "Workspace",
-    "app": "App"
+    "app": "App",
+    "lakebase_endpoint": "Endpoint de Lakebase",
+    "vector_search_endpoint": "Endpoint de Vector Search"
   },
   "ev": {
     "today": "Hoy",
@@ -389,7 +391,8 @@
     "apps": "Apps",
     "governance": "Gobernanza",
     "sharing": "Delta Sharing",
-    "storage": "Almacenamiento"
+    "storage": "Almacenamiento",
+    "lakebase": "Lakebase"
   },
   "byCategory": "Por categoría",
   "topLevers": "Mayores palancas",

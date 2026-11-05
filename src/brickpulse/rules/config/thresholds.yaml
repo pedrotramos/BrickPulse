@@ -435,7 +435,7 @@ untagged_spend:
   # account carries `Owner` AND `owner` as separate keys, and `Project` AND
   # `project` — an exact-match check would report tagged resources as untagged
   # and make the whole report ignorable. Add your organization's spellings here.
-  required_tags:
+  required_tags: &required_tags
     owner: [owner, ownedby, owner_email, ownername, contact]
     team: [team, department, dept, group, businessunit, business_unit]
     project: [project, application, app, service, workload]
@@ -741,3 +741,35 @@ coding_agent_smart_routing:
   max_savings_rate: 0.6          # cap on a measured rate: routed sessions are self-selected
   min_unrouted_sessions: 10      # enough unrouted sessions to be a habit, not a trial
   min_addressable_usd: 100       # floor on monthly unrouted premium-model spend
+
+# Lakebase endpoints whose always-on floor bills through hours with no client
+# connected (Labs). Billing marks the floor (compute_type COMPUTE_NODE_ALWAYS_ON_MIN,
+# i.e. scale-to-zero off) and system.lakebase.database_gauges counts client
+# backends every 30 s. The telemetry tables keep 7 days and must be enabled in
+# Previews, so the window is min(lookback_days, telemetry_days). Estimated, not
+# booked. See catalog/lakebase_scale_to_zero.py.
+lakebase_scale_to_zero:
+  enabled: true
+  telemetry_days: 7              # system.lakebase.* retention
+  min_samples_per_hour: 60       # of ~120 gauge samples/hour, before an hour can be judged
+  min_telemetry_coverage: 0.8    # share of billed floor hours that must carry telemetry
+  min_idle_run_hours: 2          # idle stretches shorter than this are not counted
+  suspend_timeout_minutes: 5     # timeout we recommend; each idle run still bills it
+  gib_per_cu: 2                  # host memory per CU, measured; only feeds the 32 CU guard
+  max_scale_to_zero_cu: 32       # Lakebase allows scale-to-zero only up to this max CU
+  guaranteed_scale_to_zero_cu: 16  # floor <= this => max <= 32 CU (max - min <= 16)
+  min_monthly_savings_usd: 10    # floor on the monthly reclaimable cost
+  high_priority_monthly_usd: 200
+
+# Serverless spend (Apps, serverless pipelines, Lakebase, Vector Search, Model
+# Serving) missing required ownership tags (Labs, governance). Disjoint from
+# untagged_spend, which covers usage carrying a cluster, warehouse or job id. Uses
+# the same tag aliases through the YAML anchor so the two lists cannot drift.
+# Advisory ($0). See catalog/serverless_untagged_spend.py.
+serverless_untagged_spend:
+  enabled: true
+  required_tags: *required_tags
+  min_missing_tags: 1
+  min_monthly_cost_usd: 50
+  high_priority_monthly_usd: 1000
+  medium_priority_monthly_usd: 250

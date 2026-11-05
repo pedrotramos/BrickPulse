@@ -7,6 +7,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Labs rule `lakebase_scale_to_zero`: Lakebase endpoints whose always-on floor bills through hours with no
+  client connected, priced per 10-minute slot at each region's own rate. Needs the Lakebase Observability
+  system tables (Beta, 7-day retention), enabled from the workspace Previews page.
+- Labs rule `serverless_untagged_spend`: Apps, serverless pipelines, Lakebase, Vector Search and Model
+  Serving spend missing the required ownership tags. It reuses the `untagged_spend` tag aliases and never
+  covers the same usage.
+
 ### Changed
 
 - Updated the frontend (Playwright, Prettier, TanStack Query, Radix UI, JetBrains Mono) and Python runtime
