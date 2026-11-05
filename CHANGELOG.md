@@ -7,6 +7,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
 ### Added
 
 - Labs rule `lakebase_scale_to_zero`: Lakebase endpoints whose always-on floor bills through hours with no
@@ -46,5 +48,6 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Continuous integration (lint, Python tests on 3.10 and 3.13, frontend type check and build, committed
   build check, Playwright smoke tests), Dependabot, and issue and pull request templates.
 
-[Unreleased]: https://github.com/pedrotramos/BrickPulse/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pedrotramos/BrickPulse/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/pedrotramos/BrickPulse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pedrotramos/BrickPulse/releases/tag/v0.1.0
