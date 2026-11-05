@@ -20,6 +20,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Times of events (last refresh, data-health check, snapshot) show in the browser's time zone with
+  its abbreviation. Billing days, hour-of-day heatmaps and evidence series stay in UTC, the zone system
+  tables aggregate in.
 - Updated the frontend (Playwright, Prettier, TanStack Query, Radix UI, JetBrains Mono) and Python runtime
   dependencies (FastAPI, Uvicorn, Pydantic, Databricks SDK and SQL connector, python-dotenv, ruff).
 - CI tests the pinned runtime versions in `requirements.txt`.

@@ -46,7 +46,7 @@ import {
 import { useApi, useScope } from "../lib/api";
 import { setLocale } from "../lib/i18n";
 import i18n from "../lib/i18n";
-import { date } from "../lib/format";
+import { instant } from "../lib/format";
 import { Heading, Notice, PAGE_EVENT, ScopedLink } from "../components/ui";
 import type { Config, Health, Locale, Spend, Workspace } from "../lib/types";
 import OverviewPage from "../features/overview/OverviewPage";
@@ -366,7 +366,7 @@ function Shell() {
           <div className="scope-line">
             <span>
               {health.data?.last_run?.finished_at
-                ? `${t("updated")} ${date(health.data.last_run.finished_at, i18n.language)} UTC`
+                ? `${t("updated")} ${instant(health.data.last_run.finished_at, i18n.language)}`
                 : health.isError
                   ? `${t("freshness")} · ${t("notAvailable")}`
                   : health.data

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { ArrowUpRight } from "lucide-react";
 import { useApi } from "../../lib/api";
 import type { Finding, Group } from "../../lib/types";
-import { date, money } from "../../lib/format";
+import { instant, money } from "../../lib/format";
 import {
   Back,
   Badge,
@@ -101,7 +101,7 @@ function FindingDetail({
           {t("owner")}: <strong>{f.resource_owner ?? t("unknown")}</strong>
         </span>
         <span>
-          {t("snapshot")}: {date(f.computed_at, i18n.language)} UTC
+          {t("snapshot")}: {instant(f.computed_at, i18n.language)}
         </span>
       </div>
       <Metrics
