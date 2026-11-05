@@ -11,7 +11,7 @@ import type {
   Spend,
   Workspace,
 } from "../../lib/types";
-import { date, money, month, number } from "../../lib/format";
+import { date, instant, money, month, number } from "../../lib/format";
 import {
   Badge,
   Empty,
@@ -248,14 +248,14 @@ function HealthPage() {
           <>
             <Notice tone={d.degraded || d.unknown ? "warning" : "info"}>
               {t(d.unknown ? "pending" : d.degraded ? "degraded" : "healthy")} ·{" "}
-              {date(d.checked_at, i18n.language)} UTC
+              {instant(d.checked_at, i18n.language)}
             </Notice>
             {d.last_run && (
               <section className="panel run-panel">
                 <h2>{t("lastRun")}</h2>
                 <p>
                   {d.last_run.finished_at
-                    ? date(d.last_run.finished_at, i18n.language) + " UTC"
+                    ? instant(d.last_run.finished_at, i18n.language)
                     : t("notAvailable")}{" "}
                   ·{" "}
                   {t(

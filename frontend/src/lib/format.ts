@@ -20,6 +20,27 @@ export const date = (value: string, locale: string, short = false) => {
           : { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" },
       ).format(parsed);
 };
+/**
+ * A moment in time (a refresh finished, a snapshot was taken), shown in the viewer's
+ * own time zone with its abbreviation. A value without a zone suffix is UTC, as the
+ * API and system tables are. Analytical buckets (billing days, hour-of-day heatmaps,
+ * evidence series) stay in UTC through `date`/`hour`: system tables aggregate in UTC,
+ * and shifting a bucket would move hours near midnight to another day.
+ */
+export const instant = (value: string, locale: string) => {
+  const iso = value.trim().replace(" ", "T");
+  const parsed = new Date(/(Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`);
+  return Number.isNaN(parsed.getTime())
+    ? value
+    : new Intl.DateTimeFormat(locale, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZoneName: "short",
+      }).format(parsed);
+};
 export const month = (value: string, locale: string) => {
   const match = /^(\d{4})-(\d{2})/.exec(value);
   return match

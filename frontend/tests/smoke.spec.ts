@@ -252,3 +252,18 @@ test("the selected workspace survives in-app navigation; only the picker clears 
     /\/cost-anomalies\?workspace_id=6120394857612039/,
   );
 });
+
+test.describe("instants use the browser's time zone", () => {
+  test.use({ timezoneId: "America/Sao_Paulo" });
+  test("the data-health check time shows the local zone, not UTC", async ({
+    page,
+  }) => {
+    await page.addInitScript(() =>
+      localStorage.setItem("brickpulse.locale", "en"),
+    );
+    await page.goto("/data-health");
+    const notice = page.locator(".notice").first();
+    await expect(notice).toContainText(/GMT-3|BRT/);
+    await expect(notice).not.toContainText("UTC");
+  });
+});
