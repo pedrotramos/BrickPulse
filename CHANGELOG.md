@@ -7,6 +7,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-06
+
 ### Added
 
 - Genie costs: a USD/DBU toggle (kept in the URL as `?unit=dbu`) that switches the headline figure, the
@@ -25,6 +27,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Genie costs: run the pipeline once after upgrading. The user and space queries gained columns, and until
+  the next run older snapshot rows value the free tier at the account-wide rate (users, workspaces) or show
+  no equivalent (spaces).
 - Genie costs: the user and space tables are no longer cut at 25 rows. They carry up to 1,000 rows ranked by
   spend and say when there are more.
 - Genie costs: "Observed spend" is now "Billed spend", since the free tier bills at $0 and it never
@@ -76,6 +81,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Continuous integration (lint, Python tests on 3.10 and 3.13, frontend type check and build, committed
   build check, Playwright smoke tests), Dependabot, and issue and pull request templates.
 
-[Unreleased]: https://github.com/pedrotramos/BrickPulse/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/pedrotramos/BrickPulse/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/pedrotramos/BrickPulse/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pedrotramos/BrickPulse/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pedrotramos/BrickPulse/releases/tag/v0.1.0
