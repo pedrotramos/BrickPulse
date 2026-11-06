@@ -25,16 +25,28 @@ import { isRecord, Legend, nums, records, type Viz } from "./evidence/shared";
 export { isRecord };
 
 const AVERAGE_DAYS = 7;
-export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
+export function SpendChart({
+  data,
+  title,
+  unit = "usd",
+}: {
+  data: Day[];
+  title?: string;
+  unit?: "usd" | "dbu";
+}) {
   const { t, i18n } = useTranslation();
   if (!data.length) return <Empty />;
+  const seriesLabel = title ?? t("dailySpend");
+  const format = (v: number) =>
+    unit === "dbu" ? number(v, i18n.language, 2) : money(v, i18n.language);
   // The current UTC day is still accruing: it is drawn dashed and kept out of the
   // average, so a half-billed day never reads as a drop in spend.
   const today = new Date().toISOString().slice(0, 10);
   const base = data.map((day) => ({
     date: day.usage_date,
     // A day without a value is a gap in the source, not zero spend.
-    value: day.spend_usd ?? day.cost_usd ?? null,
+    value:
+      unit === "dbu" ? (day.dbus ?? null) : (day.spend_usd ?? day.cost_usd ?? null),
     partial: day.usage_date.slice(0, 10) >= today,
   }));
   const complete = base.filter((r) => !r.partial);
@@ -62,7 +74,7 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
   const hasPartial = base.some((r) => r.partial);
   return (
     <div className="chart-block">
-      <div className="chart" role="img" aria-label={title ?? t("dailySpend")}>
+      <div className="chart" role="img" aria-label={seriesLabel}>
         <ResponsiveContainer width="100%" height="100%">
           <LineChart
             data={rows}
@@ -88,8 +100,8 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
                 `${date(String(v), i18n.language, true)}${payload?.[0]?.payload?.partial ? ` · ${t("ev.partialDay")}` : ""}`
               }
               formatter={(v, name) => [
-                v == null ? t("notAvailable") : money(Number(v), i18n.language),
-                name === "average" ? t("sevenDayAverage") : "USD",
+                v == null ? t("notAvailable") : format(Number(v)),
+                name === "average" ? t("sevenDayAverage") : unit.toUpperCase(),
               ]}
               filterNull
             />
@@ -133,7 +145,7 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
       {(hasAverage || hasPartial) && (
         <Legend
           items={[
-            { label: t("dailySpend"), swatch: "line swatch-observed" },
+            { label: seriesLabel, swatch: "line swatch-observed" },
             ...(hasAverage
               ? [{ label: t("sevenDayAverage"), swatch: "line swatch-prior" }]
               : []),
@@ -146,7 +158,7 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
         <Table
           rows={rows}
           rowKey={(r) => r.date}
-          caption={t("dailySpend")}
+          caption={seriesLabel}
           columns={[
             {
               key: "date",
@@ -156,12 +168,10 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
             },
             {
               key: "value",
-              label: "USD",
+              label: unit.toUpperCase(),
               numeric: true,
               render: (r) =>
-                r.value == null
-                  ? t("notAvailable")
-                  : money(r.value, i18n.language),
+                r.value == null ? t("notAvailable") : format(r.value),
             },
             ...(hasAverage
               ? [
@@ -170,7 +180,7 @@ export function SpendChart({ data, title }: { data: Day[]; title?: string }) {
                     label: t("sevenDayAverage"),
                     numeric: true,
                     render: (r: (typeof rows)[number]) =>
-                      r.average == null ? "—" : money(r.average, i18n.language),
+                      r.average == null ? "—" : format(r.average),
                   },
                 ]
               : []),

@@ -300,7 +300,7 @@ Three facts drive the whole design (all verified live against `system.billing.us
 1. **The free tier is a separate SKU, not a discount.** `GENIE_FREE_USAGE` has **no
    row at all** in `billing.list_prices`, so it prices to exactly `$0`. The
    free-vs-paid split is therefore *read from billing*, never inferred from a spend
-   threshold — which is why the tab can state "N% never went paid" as a fact.
+   threshold — so the free-tier figures are facts read from billing, not estimates.
 2. **Paid Genie does not mention "genie" in its SKU name.** It bills as
    `PREMIUM_SERVERLESS_REAL_TIME_INFERENCE_<REGION>` — the inference SKU. A
    `sku_name LIKE '%GENIE%'` filter silently returns *free usage only*, making paid
@@ -313,6 +313,23 @@ Three facts drive the whole design (all verified live against `system.billing.us
 Other columns used: `usage_metadata.genie.surface`
 (`GENIE_CODE`/`GENIE_AGENTS`/`GENIE_ONE`), `.channel` (`UI`/`API`), and
 `identity_metadata.run_as` for the principal.
+
+### Units and period basis
+The tab has a USD/DBU toggle (`?unit=dbu`; USD by default). `genie_source._rollup` normalizes every
+window total to a 30-day month once, in the backend, so USD and DBU share a basis: each aggregate carries
+`monthly_spend_usd` and `monthly_dbus` (users and the free tier also `monthly_free_dbus` /
+`monthly_paid_dbus`). Only the daily trend is not normalized; `GenieDay.dbus` is the day's free + paid DBUs.
+The free tier has no price, so its figures are always DBU and never follow the toggle. The USD equivalent of the free tier is an **estimate**, never billing:
+`monthly_equivalent_usd` (free surface rows), `free_tier.monthly_free_equivalent_usd` and
+`monthly_total_value_usd` (billed + equivalent). The rate is paid spend ÷ paid DBUs of the same surface
+and channel, falling back to the account-wide paid rate, and to 0 when nothing is paid. It is kept out of
+`monthly_spend_usd`. The same estimate is applied per user, workspace and space. The user query adds `free_by_surface` (unrounded
+free DBUs by surface and channel) so each row is valued at its own surfaces' rates; spaces use the Genie Spaces
+rate. Snapshot rows written before those columns existed fall back to the account-wide rate for users and
+workspaces, and show a zero equivalent for spaces until the pipeline next runs.
+Users and spaces are capped at 1,000 rows each (`_TOP_USERS`, `_TOP_SPACES`), ranked by spend; the UI sorts,
+filters and pages them in the browser, and `space_total` / `free_tier.total_users` say when rows were cut. When
+`lookback_days` is below 30 (the live fallback), the UI warns that the month is extrapolated.
 
 ### Budgets are not available
 `usage_metadata.budget_policy_id` is **NULL on every Genie usage row**, and account

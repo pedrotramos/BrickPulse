@@ -3,8 +3,11 @@ import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import {
   AlertCircle,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
+  ArrowUp,
+  ArrowUpDown,
   Database,
   RefreshCw,
 } from "lucide-react";
@@ -240,11 +243,14 @@ export function Metrics({
     </dl>
   );
 }
+export type SortState = { key: string; dir: "asc" | "desc" };
 export function Table<T>({
   rows,
   columns,
   rowKey,
   caption,
+  sort,
+  onSort,
 }: {
   rows: T[];
   columns: {
@@ -252,9 +258,13 @@ export function Table<T>({
     label: string;
     render: (row: T) => ReactNode;
     numeric?: boolean;
+    /** Makes the header a sort control. Needs `onSort` on the table. */
+    sortable?: boolean;
   }[];
   rowKey: (row: T) => string;
   caption: string;
+  sort?: SortState | null;
+  onSort?: (key: string) => void;
 }) {
   return (
     <div
@@ -272,8 +282,36 @@ export function Table<T>({
                 scope="col"
                 key={c.key}
                 className={c.numeric ? "numeric" : ""}
+                aria-sort={
+                  c.sortable && onSort
+                    ? sort?.key === c.key
+                      ? sort.dir === "asc"
+                        ? "ascending"
+                        : "descending"
+                      : "none"
+                    : undefined
+                }
               >
-                {c.label}
+                {c.sortable && onSort ? (
+                  <button
+                    type="button"
+                    className="sort-button"
+                    onClick={() => onSort(c.key)}
+                  >
+                    {c.label}
+                    {sort?.key === c.key ? (
+                      sort.dir === "asc" ? (
+                        <ArrowUp size={13} aria-hidden="true" />
+                      ) : (
+                        <ArrowDown size={13} aria-hidden="true" />
+                      )
+                    ) : (
+                      <ArrowUpDown size={13} aria-hidden="true" />
+                    )}
+                  </button>
+                ) : (
+                  c.label
+                )}
               </th>
             ))}
           </tr>

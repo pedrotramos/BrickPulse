@@ -7,6 +7,31 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Genie costs: a USD/DBU toggle (kept in the URL as `?unit=dbu`) that switches the headline figure, the
+  daily chart and the surface, space, workspace and user tables. The free tier has no price, so its
+  columns always stay in DBU.
+- Genie costs: the top cards now read billed spend, the free tier's USD equivalent and the total value of
+  usage. The equivalent is an estimate (free DBUs at the average paid rate of the same product and
+  channel) and is never added to billed spend.
+- Tables that can run long now page, filter and sort in the browser: the Genie tables, Workspaces, Apps,
+  Cost anomalies, Rules, and the Tagging and Labs findings. Click a header to sort, type to filter.
+  Opportunities keeps its own server-side paging, and short evidence tables are unchanged.
+- Genie costs: users, spaces, workspaces and products each show billed USD, the free tier's USD equivalent
+  and the total value (or free, paid and total DBU), so every table reads like the cards above it.
+- Genie costs: a one-line description under every panel saying what it shows, and a warning when the
+  figures come from fewer than 30 days and are extrapolated to a month.
+
+### Changed
+
+- Genie costs: the user and space tables are no longer cut at 25 rows. They carry up to 1,000 rows ranked by
+  spend and say when there are more.
+- Genie costs: "Observed spend" is now "Billed spend", since the free tier bills at $0 and it never
+  included free usage.
+- Genie costs: the surface table now uses the same normalized 30-day month as the other tables, shows the
+  product's display name instead of the raw `GENIE_CODE` code, and has a free/paid tier column.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

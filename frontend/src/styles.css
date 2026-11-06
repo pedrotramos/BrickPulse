@@ -921,6 +921,24 @@ tbody tr:last-child td {
   font-size: var(--text-micro);
   font-variant-numeric: tabular-nums;
 }
+.unit-toggle {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.unit-toggle button {
+  border-color: transparent;
+  background: transparent;
+  font-size: var(--text-small);
+  padding: 5px 12px;
+  min-height: 33px;
+  color: var(--muted);
+}
+.unit-toggle button[aria-pressed="true"] {
+  border-color: #bed3d8;
+  background: var(--selected);
+  color: var(--accent);
+}
 .filters {
   display: flex;
   flex-wrap: wrap;
@@ -963,6 +981,32 @@ tbody tr:last-child td {
   background: transparent;
   font-size: var(--text-small);
   color: var(--muted);
+}
+.sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  min-height: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+th.numeric .sort-button {
+  flex-direction: row-reverse;
+}
+th[aria-sort="none"] .sort-button svg {
+  opacity: 0.45;
+}
+.sort-button:hover {
+  color: var(--ink, inherit);
+}
+.table-empty {
+  padding: 22px 24px;
+  color: var(--muted);
+  font-size: var(--text-small);
 }
 .table-toolbar {
   display: flex;
@@ -1672,17 +1716,6 @@ tbody tr:last-child td {
   margin-top: 8px;
   font-size: var(--text-small);
 }
-.standalone-search {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 20px;
-  font-size: var(--text-small);
-  color: var(--muted);
-}
-.standalone-search input {
-  width: 340px;
-}
 .settings-panel {
   max-width: 900px;
 }
@@ -2144,14 +2177,6 @@ tbody tr:last-child td {
     gap: 16px;
   }
   .setting select {
-    width: 100%;
-  }
-  .standalone-search {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 6px;
-  }
-  .standalone-search input {
     width: 100%;
   }
   .genie-panel form {

@@ -1,4 +1,5 @@
-import { useState, type ReactNode } from "react";
+import { type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useApi, useScope } from "../../lib/api";
 import type {
@@ -23,38 +24,8 @@ import {
   Table,
 } from "../../components/ui";
 import { isRecord, NumericEvidence, SpendChart } from "../../components/Charts";
+import { DataTable, type DataColumn } from "../../components/DataTable";
 
-function Slice<T>({
-  rows,
-  children,
-}: {
-  rows: T[];
-  children: (rows: T[]) => ReactNode;
-}) {
-  const { t } = useTranslation();
-  const [page, setPage] = useState(1);
-  const pages = Math.max(1, Math.ceil(rows.length / 25));
-  const current = Math.min(page, pages);
-  return (
-    <>
-      {children(rows.slice((current - 1) * 25, current * 25))}
-      {pages > 1 && (
-        <div className="pagination">
-          <span>{t("page", { page: current, pages })}</span>
-          <button disabled={current === 1} onClick={() => setPage(current - 1)}>
-            {t("previous")}
-          </button>
-          <button
-            disabled={current === pages}
-            onClick={() => setPage(current + 1)}
-          >
-            {t("next")}
-          </button>
-        </div>
-      )}
-    </>
-  );
-}
 function Findings({ labs }: { labs: boolean }) {
   const { t, i18n } = useTranslation();
   const query = useApi<{
@@ -98,46 +69,48 @@ function Findings({ labs }: { labs: boolean }) {
             />
             {d.items.length ? (
               <section className="panel resource-panel">
-                <Slice rows={d.items}>
-                  {(items) => (
-                    <Table
-                      rows={items}
-                      rowKey={(r) => r.finding_key}
-                      caption={t(labs ? "labs" : "tagging")}
-                      columns={[
-                        {
-                          key: "resource",
-                          label: t("resource"),
-                          render: (r) => (
-                            <>
-                              <ScopedLink
-                                to={`/recommendations/${r.finding_key}`}
-                                className="resource-link"
-                              >
-                                {r.resource_name}
-                              </ScopedLink>
-                              <span className="cell-sub">
-                                {r.workspace_name ?? r.workspace_id}
-                              </span>
-                            </>
-                          ),
-                        },
-                        {
-                          key: "title",
-                          label: t("recommendation"),
-                          render: (r) => r.rule_title,
-                        },
-                        {
-                          key: "spend",
-                          label: t("monthlySpend"),
-                          numeric: true,
-                          render: (r) =>
-                            money(r.monthly_waste_usd, i18n.language),
-                        },
-                      ]}
-                    />
-                  )}
-                </Slice>
+                <DataTable
+                  rows={d.items}
+                  rowKey={(r) => r.finding_key}
+                  caption={t(labs ? "labs" : "tagging")}
+                  search={(r) =>
+                    `${r.resource_name} ${r.rule_title} ${r.workspace_name ?? ""} ${r.workspace_id}`
+                  }
+                  defaultSort={{ key: "spend", dir: "desc" }}
+                  columns={[
+                    {
+                      key: "resource",
+                      label: t("resource"),
+                      sort: (r) => r.resource_name,
+                      render: (r) => (
+                        <>
+                          <ScopedLink
+                            to={`/recommendations/${r.finding_key}`}
+                            className="resource-link"
+                          >
+                            {r.resource_name}
+                          </ScopedLink>
+                          <span className="cell-sub">
+                            {r.workspace_name ?? r.workspace_id}
+                          </span>
+                        </>
+                      ),
+                    },
+                    {
+                      key: "title",
+                      label: t("recommendation"),
+                      sort: (r) => r.rule_title,
+                      render: (r) => r.rule_title,
+                    },
+                    {
+                      key: "spend",
+                      label: t("monthlySpend"),
+                      numeric: true,
+                      sort: (r) => r.monthly_waste_usd,
+                      render: (r) => money(r.monthly_waste_usd, i18n.language),
+                    },
+                  ]}
+                />
               </section>
             ) : (
               <Empty />
@@ -170,64 +143,62 @@ function Workspaces() {
         {(rows) =>
           rows.length ? (
             <section className="panel resource-panel">
-              <Slice rows={Array.from(merged.values())}>
-                {(items) => (
-                  <Table
-                    rows={items}
-                    rowKey={(r) => r.workspace_id}
-                    caption={t("workspaces")}
-                    columns={[
-                      {
-                        key: "name",
-                        label: t("workspace"),
-                        render: (r) => (
-                          <>
-                            <ScopedLink
-                              className="resource-link"
-                              to={`/?workspace_id=${encodeURIComponent(r.workspace_id)}`}
-                            >
-                              {r.workspace_name ?? r.workspace_id}
-                            </ScopedLink>
-                            <span className="cell-sub">
-                              <code>{r.workspace_id}</code>
-                            </span>
-                          </>
-                        ),
-                      },
-                      {
-                        key: "spend",
-                        label: t("monthlySpend"),
-                        numeric: true,
-                        render: (r) => {
-                          const s = spend.data?.workspaces.find(
-                            (w) => w.workspace_id === r.workspace_id,
-                          );
-                          return s
-                            ? money(s.monthly_spend_usd, i18n.language)
-                            : "—";
-                        },
-                      },
-                      {
-                        key: "savings",
-                        label: t("monthlyOpportunity"),
-                        numeric: true,
-                        render: (r) =>
-                          money(
-                            r.monthly_savings_addressable_usd,
-                            i18n.language,
-                          ),
-                      },
-                      {
-                        key: "count",
-                        label: t("recommendations"),
-                        numeric: true,
-                        render: (r) =>
-                          number(r.recommendation_count, i18n.language),
-                      },
-                    ]}
-                  />
-                )}
-              </Slice>
+              <DataTable
+                rows={Array.from(merged.values())}
+                rowKey={(r) => r.workspace_id}
+                caption={t("workspaces")}
+                search={(r) => `${r.workspace_name ?? ""} ${r.workspace_id}`}
+                columns={[
+                  {
+                    key: "name",
+                    label: t("workspace"),
+                    sort: (r) => r.workspace_name ?? r.workspace_id,
+                    render: (r) => (
+                      <>
+                        <ScopedLink
+                          className="resource-link"
+                          to={`/?workspace_id=${encodeURIComponent(r.workspace_id)}`}
+                        >
+                          {r.workspace_name ?? r.workspace_id}
+                        </ScopedLink>
+                        <span className="cell-sub">
+                          <code>{r.workspace_id}</code>
+                        </span>
+                      </>
+                    ),
+                  },
+                  {
+                    key: "spend",
+                    label: t("monthlySpend"),
+                    numeric: true,
+                    sort: (r) =>
+                      spend.data?.workspaces.find(
+                        (w) => w.workspace_id === r.workspace_id,
+                      )?.monthly_spend_usd ?? null,
+                    render: (r) => {
+                      const s = spend.data?.workspaces.find(
+                        (w) => w.workspace_id === r.workspace_id,
+                      );
+                      return s ? money(s.monthly_spend_usd, i18n.language) : "—";
+                    },
+                  },
+                  {
+                    key: "savings",
+                    label: t("monthlyOpportunity"),
+                    numeric: true,
+                    sort: (r) => r.monthly_savings_addressable_usd,
+                    render: (r) =>
+                      money(r.monthly_savings_addressable_usd, i18n.language),
+                  },
+                  {
+                    key: "count",
+                    label: t("recommendations"),
+                    numeric: true,
+                    sort: (r) => r.recommendation_count,
+                    render: (r) => number(r.recommendation_count, i18n.language),
+                  },
+                ]}
+              />
             </section>
           ) : (
             <Empty />
@@ -330,36 +301,21 @@ function HealthPage() {
 function Rules() {
   const { t } = useTranslation();
   const query = useApi<Rule[]>("/rules", { scoped: false });
-  const [search, setSearch] = useState("");
   return (
     <>
       <Heading title={t("rules")} description={t("rulesNote")} />
-      <label className="standalone-search">
-        <span>{t("search")}</span>
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-      </label>
       <State query={query}>
         {(rows) => (
           <section className="panel resource-panel">
-            <Slice
-              rows={rows.filter((r) =>
-                `${r.id} ${r.title}`
-                  .toLowerCase()
-                  .includes(search.toLowerCase()),
-              )}
-            >
-              {(items) => (
-                <Table
-                  rows={items}
+            <DataTable
+ rows={rows}
+ search={(r) => `${r.id} ${r.title} ${r.resource_type}`}
                   rowKey={(r) => r.id}
                   caption={t("rules")}
                   columns={[
                     {
                       key: "title",
+ sort: (r) => r.title,
                       label: t("recommendation"),
                       render: (r) => (
                         <>
@@ -372,11 +328,13 @@ function Rules() {
                     },
                     {
                       key: "resource",
+ sort: (r) => r.resource_type,
                       label: t("resource"),
                       render: (r) => <code>{r.resource_type}</code>,
                     },
                     {
                       key: "status",
+ sort: (r) => r.enabled ? 1 : 0,
                       label: t("status"),
                       render: (r) => (
                         <Badge
@@ -396,9 +354,7 @@ function Rules() {
                       ),
                     },
                   ]}
-                />
-              )}
-            </Slice>
+/>
           </section>
         )}
       </State>
@@ -480,15 +436,16 @@ function Anomalies() {
                     <h2>{section.title}</h2>
                   </div>
                   {section.rows.length ? (
-                    <Slice rows={section.rows}>
-                      {(items) => (
-                        <Table
-                          rows={items}
+                    <DataTable
+ rows={section.rows}
+ search={(r) => `${r.resource_name ?? ""} ${r.sku_name ?? ""} ${r.workspace_name ?? ""} ${r.workspace_id} ${r.anomaly_type}`}
+ defaultSort={{ key: "excess", dir: "desc" }}
                           rowKey={(r) => r.anomaly_key}
                           caption={section.title}
                           columns={[
                             {
                               key: "name",
+ sort: (r) => r.resource_name ?? r.sku_name,
                               label: t("resource"),
                               render: (r) => (
                                 <>
@@ -501,11 +458,13 @@ function Anomalies() {
                             },
                             {
                               key: "type",
+ sort: (r) => r.anomaly_type,
                               label: t("anomaly"),
                               render: (r) => <Badge value={r.anomaly_type} />,
                             },
                             {
                               key: "base",
+ sort: (r) => r.baseline_median_usd,
                               label: t("baselineDaily"),
                               numeric: true,
                               render: (r) =>
@@ -513,6 +472,7 @@ function Anomalies() {
                             },
                             {
                               key: "peak",
+ sort: (r) => r.peak_cost_usd,
                               label: t("peak"),
                               numeric: true,
                               render: (r) =>
@@ -520,6 +480,7 @@ function Anomalies() {
                             },
                             {
                               key: "excess",
+ sort: (r) => r.excess_usd,
                               label: t("excess"),
                               numeric: true,
                               render: (r) => money(r.excess_usd, i18n.language),
@@ -535,9 +496,7 @@ function Anomalies() {
                               ),
                             },
                           ]}
-                        />
-                      )}
-                    </Slice>
+/>
                   ) : (
                     <Empty />
                   )}
@@ -620,15 +579,16 @@ function Apps() {
               </section>
               <section className="panel resource-panel">
                 {d.apps.length ? (
-                  <Slice rows={d.apps}>
-                    {(items) => (
-                      <Table
-                        rows={items}
+                  <DataTable
+ rows={d.apps}
+ search={(r) => `${r.app_name ?? ""} ${r.app_id} ${r.workspace_name ?? ""} ${r.workspace_id} ${r.last_deployed_by ?? ""}`}
+ defaultSort={{ key: "spend", dir: "desc" }}
                         rowKey={(r) => r.workspace_id + r.app_id}
                         caption={t("apps")}
                         columns={[
                           {
                             key: "name",
+ sort: (r) => r.app_name ?? r.app_id,
                             label: t("name"),
                             render: (r) => (
                               <>
@@ -641,23 +601,27 @@ function Apps() {
                           },
                           {
                             key: "size",
+ sort: (r) => r.compute_size,
                             label: t("size"),
                             render: (r) => r.compute_size,
                           },
                           {
                             key: "days",
+ sort: (r) => r.days_billed,
                             label: t("billedDays"),
                             numeric: true,
                             render: (r) => number(r.days_billed, i18n.language),
                           },
                           {
                             key: "dbus",
+ sort: (r) => r.dbus,
                             label: t("dbus"),
                             numeric: true,
                             render: (r) => number(r.dbus, i18n.language, 2),
                           },
                           {
                             key: "spend",
+ sort: (r) => r.monthly_spend_usd,
                             label: t("monthlySpend"),
                             numeric: true,
                             render: (r) =>
@@ -665,13 +629,12 @@ function Apps() {
                           },
                           {
                             key: "owner",
+ sort: (r) => r.last_deployed_by,
                             label: t("owner"),
                             render: (r) => r.last_deployed_by ?? t("unknown"),
                           },
                         ]}
-                      />
-                    )}
-                  </Slice>
+/>
                 ) : (
                   <Empty />
                 )}
@@ -683,42 +646,122 @@ function Apps() {
     </>
   );
 }
+type GenieUnit = "usd" | "dbu";
+/** What every Genie table row carries, per 30-day month. */
+interface Amounts {
+  billed: number;
+  freeValue: number;
+  total: number;
+  freeDbus: number;
+  paidDbus: number;
+  dbus: number;
+}
 function GenieCosts() {
   const { t, i18n } = useTranslation();
+  const [params, setParams] = useSearchParams();
+  const unit: GenieUnit = params.get("unit") === "dbu" ? "dbu" : "usd";
+  const setUnit = (next: GenieUnit) =>
+    setParams(
+      (current) => {
+        const copy = new URLSearchParams(current);
+        next === "usd" ? copy.delete("unit") : copy.set("unit", next);
+        return copy;
+      },
+      { replace: true },
+    );
+  // Every table ends in the same three columns, so a row reads the same whether it
+  // is a user, a space, a workspace or a product. In USD the free tier shows what
+  // its usage would cost at the paid rate, next to what was billed; in DBU it is
+  // the free and paid volumes. Either way the last column is their sum.
+  const amountColumns = <T extends Amounts>(): DataColumn<T>[] => {
+    const usd = (key: keyof Amounts, label: string): DataColumn<T> => ({
+      key,
+      label,
+      numeric: true,
+      sort: (r) => r[key],
+      render: (r) => money(r[key], i18n.language),
+    });
+    const dbu = (key: keyof Amounts, label: string): DataColumn<T> => ({
+      key,
+      label,
+      numeric: true,
+      sort: (r) => r[key],
+      render: (r) => number(r[key], i18n.language, 2),
+    });
+    return unit === "usd"
+      ? [
+          usd("billed", t("genieColBilled")),
+          usd("freeValue", t("genieColFreeEq")),
+          usd("total", t("genieColTotal")),
+        ]
+      : [
+          dbu("freeDbus", t("genieColFreeDbu")),
+          dbu("paidDbus", t("genieColPaidDbu")),
+          dbu("dbus", t("genieColTotalDbu")),
+        ];
+  };
+  const defaultSort = { key: unit === "usd" ? "total" : "dbus", dir: "desc" } as const;
   const config = useApi<Config>("/config", { scoped: false });
   const query = useApi<{
     unavailable: boolean;
     missing_sections: string[];
+    lookback_days: number;
     monthly_spend_usd: number;
+    monthly_dbus: number;
+    monthly_total_value_usd: number;
     total_dbus: number;
     workspace_count: number;
     daily: Day[];
     top_users: {
       principal: string;
       monthly_spend_usd: number;
-      free_dbus: number;
-      paid_dbus: number;
+      monthly_dbus: number;
+      monthly_free_dbus: number;
+      monthly_paid_dbus: number;
+      monthly_free_equivalent_usd: number;
+      monthly_total_value_usd: number;
     }[];
     surfaces: {
       surface: string;
+      surface_label: string;
       channel: string;
-      dbus: number;
-      spend_usd: number;
+      is_free: boolean;
+      monthly_dbus: number;
+      monthly_spend_usd: number;
+      monthly_equivalent_usd: number;
+      monthly_total_value_usd: number;
       users: number;
     }[];
     spaces: {
       space_id: string;
       workspace_id: string;
+      workspace_name?: string;
       monthly_spend_usd: number;
+      monthly_dbus: number;
+      monthly_free_dbus: number;
+      monthly_paid_dbus: number;
+      monthly_free_equivalent_usd: number;
+      monthly_total_value_usd: number;
       users: number;
     }[];
+    space_total: number;
     workspaces: {
       workspace_id: string;
       workspace_name?: string;
       monthly_spend_usd: number;
+      monthly_dbus: number;
+      monthly_free_dbus: number;
+      monthly_paid_dbus: number;
+      monthly_free_equivalent_usd: number;
+      monthly_total_value_usd: number;
       users: number;
     }[];
-    free_tier: { free_dbus: number; paid_dbus: number };
+    free_tier: {
+      total_users: number;
+      monthly_free_dbus: number;
+      monthly_paid_dbus: number;
+      monthly_free_equivalent_usd: number;
+    };
   }>("/genie", { enabled: config.data?.genie_costs_tab_enabled === true });
   if (config.data && !config.data.genie_costs_tab_enabled)
     return (
@@ -727,9 +770,26 @@ function GenieCosts() {
         <Notice>{t("disabled")}</Notice>
       </>
     );
+  const toggle = (
+    <div className="unit-toggle" role="group" aria-label={t("genieUnit")}>
+      {(["usd", "dbu"] as const).map((u) => (
+        <button
+          key={u}
+          aria-pressed={unit === u}
+          onClick={() => setUnit(u)}
+        >
+          {u.toUpperCase()}
+        </button>
+      ))}
+    </div>
+  );
   return (
     <>
-      <Heading title={t("genie")} description={t("genieNote")} />
+      <Heading
+        title={t("genie")}
+        description={t("genieNote")}
+        aside={toggle}
+      />
       <State query={query}>
         {(d) =>
           d.unavailable ? (
@@ -739,67 +799,139 @@ function GenieCosts() {
               {d.missing_sections.length > 0 && (
                 <Notice tone="warning">{t("unavailableSections")}</Notice>
               )}
+              {d.lookback_days < 30 && (
+                <Notice tone="warning">
+                  {t("genieShortWindow", { days: d.lookback_days })}
+                </Notice>
+              )}
               <Metrics
-                items={[
-                  {
-                    label: t("spend"),
-                    value: d.monthly_spend_usd,
-                    note: t("monthly"),
-                  },
-                  {
-                    label: t("freeTier"),
-                    value: d.free_tier.free_dbus,
-                    kind: "number",
-                    note: "DBU",
-                  },
-                  {
-                    label: t("paid"),
-                    value: d.free_tier.paid_dbus,
-                    kind: "number",
-                    note: "DBU",
-                  },
-                ]}
+                items={
+                  unit === "dbu"
+                    ? [
+                        {
+                          label: t("paid"),
+                          value: d.free_tier.monthly_paid_dbus,
+                          kind: "number",
+                          note: t("geniePaidNote"),
+                        },
+                        {
+                          label: t("freeTier"),
+                          value: d.free_tier.monthly_free_dbus,
+                          kind: "number",
+                          note: t("genieFreeNote"),
+                        },
+                        {
+                          label: t("genieTotalDbu"),
+                          value: d.monthly_dbus,
+                          kind: "number",
+                          note: t("monthlyDbu"),
+                        },
+                      ]
+                    : [
+                        {
+                          label: t("genieBilled"),
+                          value: d.monthly_spend_usd,
+                          note: t("genieBilledNote"),
+                        },
+                        {
+                          label: t("genieFreeEquivalent"),
+                          value: d.free_tier.monthly_free_equivalent_usd,
+                          note: t("genieFreeEquivalentNote"),
+                        },
+                        {
+                          label: t("genieTotalValue"),
+                          value: d.monthly_total_value_usd,
+                          note: t("genieTotalValueNote"),
+                        },
+                      ]
+                }
               />
               <section className="panel">
-                <h2>{t("dailySpend")}</h2>
-                <SpendChart data={d.daily} />
+                <div className="section-heading">
+                  <div>
+                    <h2>{t(unit === "dbu" ? "dailyUsage" : "dailySpend")}</h2>
+                    <p>{t("genieDescDaily")}</p>
+                  </div>
+                </div>
+                <SpendChart
+                  data={d.daily}
+                  unit={unit}
+                  title={t(unit === "dbu" ? "dailyUsage" : "dailySpend")}
+                />
               </section>
+              {d.space_total > d.spaces.length && (
+                <Notice>
+                  {t("genieRowsCut", {
+                    shown: d.spaces.length,
+                    total: d.space_total,
+                  })}
+                </Notice>
+              )}
+              {d.free_tier.total_users > d.top_users.length && (
+                <Notice>
+                  {t("genieRowsCut", {
+                    shown: d.top_users.length,
+                    total: d.free_tier.total_users,
+                  })}
+                </Notice>
+              )}
               <section className="panel resource-panel">
                 <div className="section-heading">
-                  <h2>{t("bySurface")}</h2>
+                  <div>
+                    <h2>{t("bySurface")}</h2>
+                    <p>{t("genieDescSurface")}</p>
+                  </div>
                 </div>
-                <Table
-                  rows={d.surfaces}
-                  rowKey={(r) => r.surface + r.channel + r.spend_usd}
+                <DataTable
+                  key={unit}
+                  rows={d.surfaces.map((r) => ({
+                    ...r,
+                    billed: r.monthly_spend_usd,
+                    freeValue: r.monthly_equivalent_usd,
+                    total: r.monthly_total_value_usd,
+                    freeDbus: r.is_free ? r.monthly_dbus : 0,
+                    paidDbus: r.is_free ? 0 : r.monthly_dbus,
+                    dbus: r.monthly_dbus,
+                  }))}
+                  rowKey={(r) => `${r.surface}|${r.channel}|${r.is_free}`}
                   caption={t("bySurface")}
+                  search={(r) =>
+                    `${r.surface_label} ${r.surface} ${r.channel} ${t(r.is_free ? "tierFree" : "tierPaid")}`
+                  }
+                  defaultSort={defaultSort}
                   columns={[
                     {
                       key: "surface",
                       label: t("product"),
+                      sort: (r) => r.surface_label,
                       render: (r) => (
-                        <code>
-                          {r.surface} · {r.channel}
-                        </code>
+                        <>
+                          {r.surface_label}
+                          <span className="cell-sub">
+                            <code>{r.surface}</code> · {r.channel}
+                          </span>
+                        </>
+                      ),
+                    },
+                    {
+                      key: "tier",
+                      label: t("tier"),
+                      sort: (r) => (r.is_free ? 0 : 1),
+                      render: (r) => (
+                        <Badge
+                          value={r.is_free ? "free" : "paid"}
+                          label={t(r.is_free ? "tierFree" : "tierPaid")}
+                        />
                       ),
                     },
                     {
                       key: "users",
                       label: t("users"),
                       numeric: true,
+                      sort: (r) => r.users,
                       render: (r) => number(r.users, i18n.language),
                     },
-                    {
-                      key: "dbus",
-                      label: "DBU",
-                      numeric: true,
-                      render: (r) => number(r.dbus, i18n.language, 2),
-                    },
-                    {
-                      key: "spend",
-                      label: "USD",
-                      numeric: true,
-                      render: (r) => money(r.spend_usd, i18n.language),
-                    },
+                    ...amountColumns(),
                   ]}
                 />
               </section>
@@ -807,103 +939,109 @@ function GenieCosts() {
               {[
                 {
                   title: t("spaces"),
+                  description: t("genieDescSpaces"),
                   rows: d.spaces.map((r) => ({
                     id: `${r.workspace_id}/${r.space_id}`,
                     name: r.space_id,
-                    workspace: r.workspace_id,
-                    spend: r.monthly_spend_usd,
+                    workspace: r.workspace_name ?? r.workspace_id,
+                    workspaceId: r.workspace_id,
                     users: r.users,
+                    billed: r.monthly_spend_usd,
+                    freeValue: r.monthly_free_equivalent_usd,
+                    total: r.monthly_total_value_usd,
+                    freeDbus: r.monthly_free_dbus,
+                    paidDbus: r.monthly_paid_dbus,
+                    dbus: r.monthly_dbus,
                   })),
                 },
                 {
                   title: t("workspaces"),
+                  description: t("genieDescWorkspaces"),
                   rows: d.workspaces.map((r) => ({
                     id: r.workspace_id,
                     name: r.workspace_name ?? r.workspace_id,
                     workspace: r.workspace_id,
-                    spend: r.monthly_spend_usd,
+                    workspaceId: r.workspace_id,
                     users: r.users,
+                    billed: r.monthly_spend_usd,
+                    freeValue: r.monthly_free_equivalent_usd,
+                    total: r.monthly_total_value_usd,
+                    freeDbus: r.monthly_free_dbus,
+                    paidDbus: r.monthly_paid_dbus,
+                    dbus: r.monthly_dbus,
                   })),
                 },
               ].map((section) => (
                 <section className="panel resource-panel" key={section.title}>
                   <div className="section-heading">
-                    <h2>{section.title}</h2>
+                    <div>
+                      <h2>{section.title}</h2>
+                      <p>{section.description}</p>
+                    </div>
                   </div>
-                  <Slice rows={section.rows}>
-                    {(rows) => (
-                      <Table
-                        rows={rows}
-                        rowKey={(r) => r.id}
-                        caption={section.title}
-                        columns={[
-                          {
-                            key: "name",
-                            label: t("name"),
-                            render: (r) => (
-                              <>
-                                {r.name}
-                                <span className="cell-sub">{r.workspace}</span>
-                              </>
-                            ),
-                          },
-                          {
-                            key: "users",
-                            label: t("users"),
-                            numeric: true,
-                            render: (r) => number(r.users, i18n.language),
-                          },
-                          {
-                            key: "spend",
-                            label: t("monthlySpend"),
-                            numeric: true,
-                            render: (r) => money(r.spend, i18n.language),
-                          },
-                        ]}
-                      />
-                    )}
-                  </Slice>
+                  <DataTable
+                    key={unit}
+                    rows={section.rows}
+                    rowKey={(r) => r.id}
+                    caption={section.title}
+                    search={(r) => `${r.name} ${r.workspace} ${r.workspaceId}`}
+                    defaultSort={defaultSort}
+                    columns={[
+                      {
+                        key: "name",
+                        label: t("name"),
+                        sort: (r) => r.name,
+                        render: (r) => (
+                          <>
+                            {r.name}
+                            <span className="cell-sub">{r.workspace}</span>
+                          </>
+                        ),
+                      },
+                      {
+                        key: "users",
+                        label: t("users"),
+                        numeric: true,
+                        sort: (r) => r.users,
+                        render: (r) => number(r.users, i18n.language),
+                      },
+                      ...amountColumns(),
+                    ]}
+                  />
                 </section>
               ))}
               <section className="panel resource-panel">
                 <div className="section-heading">
-                  <h2>{t("topUsers")}</h2>
+                  <div>
+                    <h2>{t("topUsers")}</h2>
+                    <p>{t("genieDescUsers")}</p>
+                  </div>
                 </div>
-                <Slice rows={d.top_users}>
-                  {(items) => (
-                    <Table
-                      rows={items}
-                      rowKey={(r) => r.principal}
-                      caption={t("topUsers")}
-                      columns={[
-                        {
-                          key: "user",
-                          label: t("name"),
-                          render: (r) => r.principal,
-                        },
-                        {
-                          key: "free",
-                          label: t("freeTier") + " · DBU",
-                          numeric: true,
-                          render: (r) => number(r.free_dbus, i18n.language, 2),
-                        },
-                        {
-                          key: "paid",
-                          label: t("paid") + " · DBU",
-                          numeric: true,
-                          render: (r) => number(r.paid_dbus, i18n.language, 2),
-                        },
-                        {
-                          key: "cost",
-                          label: t("monthlySpend"),
-                          numeric: true,
-                          render: (r) =>
-                            money(r.monthly_spend_usd, i18n.language),
-                        },
-                      ]}
-                    />
-                  )}
-                </Slice>
+                <DataTable
+                  key={unit}
+                  rows={d.top_users.map((r) => ({
+                    ...r,
+                    billed: r.monthly_spend_usd,
+                    freeValue: r.monthly_free_equivalent_usd,
+                    total: r.monthly_total_value_usd,
+                    freeDbus: r.monthly_free_dbus,
+                    paidDbus: r.monthly_paid_dbus,
+                    dbus: r.monthly_dbus,
+                  }))}
+                  rowKey={(r) => r.principal}
+                  caption={t("topUsers")}
+                  search={(r) => r.principal}
+                  defaultSort={defaultSort}
+                  columns={[
+                    {
+                      key: "user",
+                      label: t("name"),
+                      sort: (r) => r.principal,
+                      render: (r) => r.principal,
+                    },
+                    ...amountColumns(),
+                  ]}
+                />
               </section>
             </>
           )
@@ -1087,13 +1225,14 @@ function Serverless() {
                     {t("resources")}: {issue.resource_count}
                   </span>
                 </div>
-                <Table
+                <DataTable
                   rows={issue.examples}
                   rowKey={(r) => r.resource_id}
                   caption={t(`issues.${issue.key}`)}
                   columns={[
                     {
                       key: "resource",
+ sort: (r) => r.resource_name,
                       label: t("resource"),
                       render: (r) =>
                         r.group_id ? (
@@ -1109,6 +1248,7 @@ function Serverless() {
                     },
                     {
                       key: "value",
+ sort: (r) => r.monthly_savings_usd,
                       label: t("monthlyOpportunity"),
                       numeric: true,
                       render: (r) =>
