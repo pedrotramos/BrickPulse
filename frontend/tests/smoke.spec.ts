@@ -60,6 +60,7 @@ test("all analysis routes load", async ({ page }) => {
     "/settings",
     "/apps",
     "/genie-costs",
+    "/genie-costs?unit=dbu",
   ]) {
     await page.goto(path);
     await expect(page.locator("h1")).toBeVisible();
@@ -266,4 +267,44 @@ test.describe("instants use the browser's time zone", () => {
     await expect(notice).toContainText(/GMT-3|BRT/);
     await expect(notice).not.toContainText("UTC");
   });
+});
+
+test("a long table pages, filters and sorts in the browser", async ({ page }) => {
+  await page.addInitScript(() =>
+    localStorage.setItem("brickpulse.locale", "en"),
+  );
+  await page.goto("/genie-costs");
+  const users = page.locator(".resource-panel", {
+    has: page.getByRole("heading", { name: "Users by spend" }),
+  });
+  const rows = users.locator("tbody tr");
+  const status = users.getByRole("status");
+
+  // More than one page of rows, with the count of what is loaded.
+  await expect(users.locator(".pagination")).toContainText(/Page 1 of [2-9]/);
+  await expect(rows).toHaveCount(25);
+  await expect(status).toHaveText(/^\d+ of \d+ rows$/);
+
+  // Text sorts A to Z first, then Z to A, and the header says which.
+  const name = users.getByRole("button", { name: "Name" });
+  await name.click();
+  await expect(users.locator('th[aria-sort="ascending"]')).toHaveCount(1);
+  const first = await rows.first().locator("td").first().innerText();
+  await name.click();
+  await expect(users.locator('th[aria-sort="descending"]')).toHaveCount(1);
+  expect(await rows.first().locator("td").first().innerText()).not.toBe(first);
+
+  // Filtering narrows the count, drops the pager, and an empty result says so.
+  const filter = users.getByRole("searchbox");
+  await filter.fill("elif");
+  await expect(status).toHaveText(/^\d+ of \d+ rows$/);
+  await expect(users.locator(".pagination")).toHaveCount(0);
+  await filter.fill("no-such-person-anywhere");
+  await expect(users.locator(".table-empty")).toBeVisible();
+  await filter.fill("");
+
+  // Switching to DBU swaps the amount columns and starts the table over.
+  await page.getByRole("button", { name: "DBU", exact: true }).click();
+  await expect(users.getByRole("columnheader", { name: /Total DBU/ })).toBeVisible();
+  await expect(users.getByRole("columnheader", { name: /Billed USD/ })).toHaveCount(0);
 });

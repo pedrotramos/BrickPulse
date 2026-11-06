@@ -39,6 +39,15 @@ class GenieUser(BaseModel):
     paid_dbus: float = 0.0
     spend_usd: float = 0.0
     monthly_spend_usd: float = 0.0
+    #: The window totals above, normalized to a 30-day month like
+    #: ``monthly_spend_usd`` so the UI can show DBUs on the same basis as USD.
+    monthly_free_dbus: float = 0.0
+    monthly_paid_dbus: float = 0.0
+    monthly_dbus: float = 0.0
+    #: Estimated USD value of this user's free DBUs and the total once added to
+    #: billed spend (see ``GenieSurface.monthly_equivalent_usd``).
+    monthly_free_equivalent_usd: float = 0.0
+    monthly_total_value_usd: float = 0.0
     active_days: int = 0
     last_active_date: str | None = None
     #: Surface/channel mix for this user, biggest first — explains *why* they are
@@ -72,6 +81,15 @@ class GenieSurface(BaseModel):
     is_free: bool = False
     dbus: float = 0.0
     spend_usd: float = 0.0
+    #: Window totals normalized to a 30-day month (see ``GenieUser``).
+    monthly_dbus: float = 0.0
+    monthly_spend_usd: float = 0.0
+    #: Free rows only: what this usage would cost at the average paid rate of the
+    #: same surface and channel. An estimate, not billing — the free tier is billed
+    #: at $0 — so it is kept apart from ``spend_usd`` and never added to it.
+    monthly_equivalent_usd: float = 0.0
+    #: Billed spend plus the equivalent, so free and paid rows sort on one scale.
+    monthly_total_value_usd: float = 0.0
     users: int = 0
 
 
@@ -87,8 +105,14 @@ class GenieSpace(BaseModel):
     workspace_name: str | None = None
     workspace_url: str | None = None
     dbus: float = 0.0
+    monthly_dbus: float = 0.0
+    monthly_free_dbus: float = 0.0
+    monthly_paid_dbus: float = 0.0
     spend_usd: float = 0.0
     monthly_spend_usd: float = 0.0
+    #: Free DBUs valued at the Genie Spaces paid rate, and the total with billed spend.
+    monthly_free_equivalent_usd: float = 0.0
+    monthly_total_value_usd: float = 0.0
     users: int = 0
     active_days: int = 0
     #: Share of this space's DBUs driven through the REST API rather than the UI.
@@ -114,6 +138,11 @@ class GenieWorkspace(BaseModel):
     monthly_spend_usd: float = 0.0
     free_dbus: float = 0.0
     paid_dbus: float = 0.0
+    monthly_dbus: float = 0.0
+    monthly_free_dbus: float = 0.0
+    monthly_paid_dbus: float = 0.0
+    monthly_free_equivalent_usd: float = 0.0
+    monthly_total_value_usd: float = 0.0
     users: int = 0
     #: Users in this workspace who spilled past the free allowance.
     paid_users: int = 0
@@ -125,6 +154,8 @@ class GenieDay(BaseModel):
     usage_date: str
     free_dbus: float = 0.0
     paid_dbus: float = 0.0
+    #: Free + paid DBUs of the day, so the trend chart can plot usage as well as spend.
+    dbus: float = 0.0
     spend_usd: float = 0.0
     users: int = 0
 
@@ -142,6 +173,11 @@ class GenieFreeTier(BaseModel):
     free_only_pct: float = 0.0
     free_dbus: float = 0.0
     paid_dbus: float = 0.0
+    #: Window totals normalized to a 30-day month, as ``GenieCosts.monthly_spend_usd``.
+    monthly_free_dbus: float = 0.0
+    monthly_paid_dbus: float = 0.0
+    #: Estimated USD value of the free DBUs (see ``GenieSurface.monthly_equivalent_usd``).
+    monthly_free_equivalent_usd: float = 0.0
     #: Free DBUs consumed by users who never went paid — the allowance actually
     #: being absorbed at $0.
     free_dbus_free_only_users: float = 0.0
@@ -154,6 +190,10 @@ class GenieCosts(BaseModel):
     total_spend_usd: float = 0.0
     monthly_spend_usd: float = 0.0
     total_dbus: float = 0.0
+    monthly_dbus: float = 0.0
+    #: Billed spend plus the free tier's estimated equivalent: the value of all usage,
+    #: as if nothing were free.
+    monthly_total_value_usd: float = 0.0
     workspace_count: int = 0
     #: True when no Genie usage could be read at all (no snapshot and the live
     #: query failed or was not permitted) — the UI omits figures rather than
@@ -171,6 +211,9 @@ class GenieCosts(BaseModel):
     workspaces: list[GenieWorkspace] = Field(default_factory=list)
     surfaces: list[GenieSurface] = Field(default_factory=list)
     spaces: list[GenieSpace] = Field(default_factory=list)
+    #: Spaces found before ``spaces`` was cut to the display cap; the UI says so when
+    #: the list is shorter than this.
+    space_total: int = 0
     daily: list[GenieDay] = Field(default_factory=list)
 
     #: The single paid surface that dominates the bill (usually Genie Code) and its

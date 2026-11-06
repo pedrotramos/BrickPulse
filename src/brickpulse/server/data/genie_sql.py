@@ -131,6 +131,12 @@ SELECT
       (l, r) -> CASE WHEN l.dbus > r.dbus THEN -1 WHEN l.dbus < r.dbus THEN 1 ELSE 0 END
     )
   )                                                 AS by_surface,
+  -- Free-tier records by surface and channel, unrounded: the free tier has no price,
+  -- so the app values it at the paid rate of the same surface and channel. The
+  -- rounded by_surface above cannot be used for that, because individual records
+  -- are routinely below 0.005 DBU and would round to zero or inflate.
+  to_json(collect_list(CASE WHEN is_free THEN struct(surface, channel, dbus) END))
+                                                    AS free_by_surface,
   MAX(usage_date)                                   AS last_active_date
 FROM priced
 GROUP BY workspace_id, principal
@@ -192,6 +198,7 @@ SELECT
   workspace_id,
   space_id,
   SUM(dbus)                                       AS dbus,
+  SUM(CASE WHEN is_free THEN dbus ELSE 0 END)     AS free_dbus,
   SUM(spend_usd)                                  AS spend_usd,
   COUNT(DISTINCT principal)                       AS users,
   COUNT(DISTINCT usage_date)                      AS active_days,

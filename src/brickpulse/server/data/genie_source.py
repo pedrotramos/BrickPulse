@@ -75,10 +75,12 @@ _CACHE_MAX_ROWS = 5000  # LRU bound by spaces + workspaces + users cached
 #: account that had plenty of Genie usage.
 _LIVE_BUDGET_S = 45
 
-#: How many rows the UI actually shows. Everything else is aggregate, so there is
-#: no reason to ship thousands of principals to the browser.
-_TOP_USERS = 25
-_TOP_SPACES = 25
+#: Most rows shipped for the user and space tables. The UI sorts, filters and pages
+#: them in the browser, so the cap bounds the response; the list is ranked by spend
+#: first, so what is cut is the smallest consumers. ``GenieCosts.space_total`` and
+#: ``free_tier.total_users`` carry the uncut counts so the UI can say it was cut.
+_TOP_USERS = 1000
+_TOP_SPACES = 1000
 
 _SNAPSHOT_KINDS = ("user", "surface", "space", "daily")
 
@@ -369,6 +371,9 @@ class DemoGenieSource(GenieSource):
                 a.setdefault("_surfaces", {})
                 sk = (e["surface"], e["channel"])
                 a["_surfaces"][sk] = a["_surfaces"].get(sk, 0.0) + e["dbus"]  # type: ignore[index]
+                if e["is_free"]:
+                    a.setdefault("_free_surfaces", {})
+                    a["_free_surfaces"][sk] = a["_free_surfaces"].get(sk, 0.0) + e["dbus"]  # type: ignore[index]
             return out
 
         users = [
@@ -381,6 +386,10 @@ class DemoGenieSource(GenieSource):
                 "by_surface": [
                     {"surface": s, "channel": c, "dbus": round(d, 2)}
                     for (s, c), d in sorted(a["_surfaces"].items(), key=lambda kv: -kv[1])
+                ],
+                "free_by_surface": [
+                    {"surface": s, "channel": c, "dbus": d}
+                    for (s, c), d in a.get("_free_surfaces", {}).items()
                 ],
             }
             for (wid, principal), a in _agg(lambda e: (e["workspace_id"], e["principal"])).items()
@@ -400,7 +409,8 @@ class DemoGenieSource(GenieSource):
         spaces = [
             {
                 "workspace_id": wid, "space_id": space_id,
-                "dbus": round(a["dbus"], 2), "spend_usd": round(a["spend_usd"], 2),
+                "dbus": round(a["dbus"], 2), "free_dbus": round(a["free_dbus"], 2),
+                "spend_usd": round(a["spend_usd"], 2),
                 "users": len(a["_users"]), "active_days": len(a["_days"]),
                 "api_dbus": round(a["api_dbus"], 2), "last_active_date": max(a["_days"]),
             }
@@ -473,6 +483,69 @@ def _surface_uses(raw) -> list[GenieSurfaceUse]:
     return out
 
 
+class _PaidRates:
+    """Average paid USD per DBU, used to value the free tier.
+
+    The free tier is billed at $0, so its USD value is an estimate: free DBUs times
+    the average rate the account actually pays (spend / DBUs). The most specific
+    paid slice wins — surface and channel, then surface, then the whole account —
+    and the rate is 0 when nothing is paid, rather than an invented price.
+    """
+
+    def __init__(self, surface_rows: list[dict]):
+        self._slice: dict[tuple[str, str], list[float]] = {}
+        self._surface: dict[str, list[float]] = {}
+        self._all = [0.0, 0.0]
+        for r in surface_rows:
+            if r.get("is_free"):
+                continue
+            surface = str(r.get("surface") or "UNKNOWN")
+            channel = str(r.get("channel") or "UNKNOWN")
+            spend, dbus = _f(r.get("spend_usd")), _f(r.get("dbus"))
+            for bucket in (
+                self._slice.setdefault((surface, channel), [0.0, 0.0]),
+                self._surface.setdefault(surface, [0.0, 0.0]),
+                self._all,
+            ):
+                bucket[0] += spend
+                bucket[1] += dbus
+
+    @staticmethod
+    def _rate(bucket: list[float] | None) -> float | None:
+        return bucket[0] / bucket[1] if bucket and bucket[1] > 0 else None
+
+    @property
+    def overall(self) -> float:
+        return self._rate(self._all) or 0.0
+
+    def surface(self, surface: str) -> float:
+        rate = self._rate(self._surface.get(surface))
+        return self.overall if rate is None else rate
+
+    def slice(self, surface: str, channel: str) -> float:
+        rate = self._rate(self._slice.get((surface, channel)))
+        return self.surface(surface) if rate is None else rate
+
+    def free_value(self, row: dict) -> float:
+        """USD value of one user row's free DBUs, over the window (not normalized).
+
+        Uses the row's free usage by surface and channel. A row from a snapshot
+        written before that column existed has none, so it falls back to its total
+        free DBUs at the account-wide rate rather than showing zero.
+        """
+        raw = row.get("free_by_surface")
+        if raw is None:
+            return _f(row.get("free_dbus")) * self.overall
+        total = 0.0
+        for item in _loads(raw) or []:
+            if isinstance(item, dict):
+                total += _f(item.get("dbus")) * self.slice(
+                    str(item.get("surface") or "UNKNOWN"),
+                    str(item.get("channel") or "UNKNOWN"),
+                )
+        return total
+
+
 def _rollup(
     data: dict[str, list[dict]], *, lookback_days: int, unavailable: bool
 ) -> GenieCosts:
@@ -497,13 +570,19 @@ def _rollup(
     # built from the un-merged rows below (each is one workspace+principal): that
     # is the only aggregate whose distinct-user count and spend per workspace are
     # both exact, since a user active in two workspaces is one row in each.
+    rates = _PaidRates(data.get("surface") or [])
     merged: dict[str, GenieUser] = {}
     ws: dict[str, GenieWorkspace] = {}
+    user_value: dict[str, float] = {}
+    ws_value: dict[str, float] = {}
     workspace_ids: set[str] = set()
     for r in data.get("user") or []:
         principal = str(r.get("principal") or "unknown")
         wid = r.get("workspace_id")
+        row_value = rates.free_value(r)
+        user_value[principal] = user_value.get(principal, 0.0) + row_value
         if wid:
+            ws_value[str(wid)] = ws_value.get(str(wid), 0.0) + row_value
             workspace_ids.add(str(wid))
             w = ws.get(str(wid))
             if w is None:
@@ -550,10 +629,16 @@ def _rollup(
         # a DBU, so rounding first would reclassify a paying user as free-tier and
         # inflate the free-tier percentage.
         u.free_only = u.paid_dbus <= 0.0
+        # Normalize from the unrounded totals so small records don't compound rounding.
+        u.monthly_free_dbus = _monthly(u.free_dbus, lookback_days)
+        u.monthly_paid_dbus = _monthly(u.paid_dbus, lookback_days)
+        u.monthly_dbus = _monthly(u.free_dbus + u.paid_dbus, lookback_days)
+        u.monthly_free_equivalent_usd = _monthly(user_value.get(u.principal, 0.0), lookback_days)
         u.free_dbus = round(u.free_dbus, 2)
         u.paid_dbus = round(u.paid_dbus, 2)
         u.spend_usd = round(u.spend_usd, 2)
         u.monthly_spend_usd = _monthly(u.spend_usd, lookback_days)
+        u.monthly_total_value_usd = round(u.monthly_spend_usd + u.monthly_free_equivalent_usd, 2)
         u.by_surface.sort(key=lambda s: s.dbus, reverse=True)
 
     free_only = [u for u in users if u.free_only]
@@ -564,6 +649,8 @@ def _rollup(
         free_only_pct=round(100.0 * len(free_only) / len(users), 1) if users else 0.0,
         free_dbus=round(sum(u.free_dbus for u in users), 2),
         paid_dbus=round(sum(u.paid_dbus for u in users), 2),
+        monthly_free_dbus=_monthly(sum(u.free_dbus for u in users), lookback_days),
+        monthly_paid_dbus=_monthly(sum(u.paid_dbus for u in users), lookback_days),
         free_dbus_free_only_users=round(sum(u.free_dbus for u in free_only), 2),
     )
 
@@ -586,7 +673,15 @@ def _rollup(
         if r.get("workspace_id"):
             workspace_ids.add(str(r["workspace_id"]))
     surfaces = sorted(surf.values(), key=lambda s: s.spend_usd, reverse=True)
+    free_equivalent = 0.0
     for s in surfaces:
+        s.monthly_dbus = _monthly(s.dbus, lookback_days)
+        s.monthly_spend_usd = _monthly(s.spend_usd, lookback_days)
+        if s.is_free:
+            value = s.dbus * rates.slice(s.surface, s.channel)
+            free_equivalent += value
+            s.monthly_equivalent_usd = _monthly(value, lookback_days)
+        s.monthly_total_value_usd = round(s.monthly_spend_usd + s.monthly_equivalent_usd, 2)
         s.dbus = round(s.dbus, 2)
         s.spend_usd = round(s.spend_usd, 2)
 
@@ -610,6 +705,7 @@ def _rollup(
     spaces: list[GenieSpace] = []
     for r in data.get("space") or []:
         dbus = _f(r.get("dbus"))
+        free = _f(r.get("free_dbus"))
         api = _f(r.get("api_dbus"))
         spend = _f(r.get("spend_usd"))
         wid = r.get("workspace_id")
@@ -622,8 +718,18 @@ def _rollup(
                 workspace_name=r.get("workspace_name"),
                 workspace_url=r.get("workspace_url"),
                 dbus=round(dbus, 2),
+                monthly_dbus=_monthly(dbus, lookback_days),
+                monthly_free_dbus=_monthly(free, lookback_days),
+                monthly_paid_dbus=_monthly(max(dbus - free, 0.0), lookback_days),
                 spend_usd=round(spend, 2),
                 monthly_spend_usd=_monthly(spend, lookback_days),
+                # Only Genie Spaces carries a space id, so its own paid rate applies.
+                monthly_free_equivalent_usd=_monthly(free * rates.surface("GENIE_AGENTS"), lookback_days),
+                monthly_total_value_usd=round(
+                    _monthly(spend, lookback_days)
+                    + _monthly(free * rates.surface("GENIE_AGENTS"), lookback_days),
+                    2,
+                ),
                 users=_i(r.get("users")),
                 active_days=_i(r.get("active_days")),
                 api_share=round(api / dbus, 3) if dbus > 0 else 0.0,
@@ -649,6 +755,7 @@ def _rollup(
             workspace_ids.add(str(r["workspace_id"]))
     daily = [by_day[k] for k in sorted(by_day)]
     for d in daily:
+        d.dbus = round(d.free_dbus + d.paid_dbus, 2)
         d.free_dbus = round(d.free_dbus, 2)
         d.paid_dbus = round(d.paid_dbus, 2)
         d.spend_usd = round(d.spend_usd, 2)
@@ -676,10 +783,15 @@ def _rollup(
     # --- per-workspace rollup -----------------------------------------------
     workspaces = list(ws.values())
     for w in workspaces:
+        w.monthly_dbus = _monthly(w.free_dbus + w.paid_dbus, lookback_days)
+        w.monthly_free_dbus = _monthly(w.free_dbus, lookback_days)
+        w.monthly_paid_dbus = _monthly(w.paid_dbus, lookback_days)
+        w.monthly_free_equivalent_usd = _monthly(ws_value.get(w.workspace_id, 0.0), lookback_days)
         w.free_dbus = round(w.free_dbus, 2)
         w.paid_dbus = round(w.paid_dbus, 2)
         w.spend_usd = round(w.spend_usd, 2)
         w.monthly_spend_usd = _monthly(w.spend_usd, lookback_days)
+        w.monthly_total_value_usd = round(w.monthly_spend_usd + w.monthly_free_equivalent_usd, 2)
     # Ranked by spend, but keep zero-spend (all-free) workspaces after the paying
     # ones rather than dropping them — an all-free workspace is a real fact worth
     # seeing, and by user count is the sensible tiebreak.
@@ -689,11 +801,20 @@ def _rollup(
     # instead of implying the account has no spaces / no trend.
     missing = [k for k in _SNAPSHOT_KINDS if not (data.get(k) or [])]
 
+    # Valued from the surface table; if only the user rows arrived, from those.
+    free_tier.monthly_free_equivalent_usd = _monthly(
+        free_equivalent or sum(user_value.values()), lookback_days
+    )
+
     return GenieCosts(
         missing_sections=missing,
         total_spend_usd=total_spend,
         monthly_spend_usd=_monthly(total_spend, lookback_days),
         total_dbus=total_dbus,
+        monthly_dbus=_monthly(total_dbus, lookback_days),
+        monthly_total_value_usd=round(
+            _monthly(total_spend, lookback_days) + free_tier.monthly_free_equivalent_usd, 2
+        ),
         workspace_count=len(workspace_ids),
         no_usage=not users and not surfaces and not daily,
         free_tier=free_tier,
@@ -701,6 +822,7 @@ def _rollup(
         workspaces=workspaces,
         surfaces=surfaces,
         spaces=spaces[:_TOP_SPACES],
+        space_total=len(spaces),
         daily=daily,
         top_paid_surface_label=top_paid_label,
         top_paid_surface_pct=top_paid_pct,
